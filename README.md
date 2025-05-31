@@ -3,10 +3,10 @@
 A Swift package for iOS (and macOS) that simplifies running local LLMs (Large Language Models) using `llama.cpp`. Designed for developers who want to integrate AI-assisted text generation directly into their Swift apps. 🧠✨
 
 > **License**: [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
-> **Platforms**: iOS 15+, macOS 12+, Mac Catalyst 15+
-> **Language**: Swift 5.9
 
----
+> **Platforms**: iOS 15+, macOS 12+, Mac Catalyst 15+
+
+> **Language**: Swift 5.9
 
 ## Features 🚀
 
@@ -17,8 +17,6 @@ A Swift package for iOS (and macOS) that simplifies running local LLMs (Large La
 - **Pre-Warming Engine**: Optional prewarming to optimize inference speed.
 - **Async/Await Support**: Modern Swift concurrency for non-blocking prediction streams.
 - **Cross-Platform**: Compatible with iOS, macOS, and Mac Catalyst.
-
----
 
 ## Getting Started 🏁
 
