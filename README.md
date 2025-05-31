@@ -25,7 +25,7 @@ A Swift package for iOS (and macOS) that simplifies running local LLMs (Large La
 ### Installation 📦
 
 1.  In Xcode, go to **File > Add Packages**.
-2.  Enter the repository URL: `https://github.com/your-username/Kuzco.git`
+2.  Enter the repository URL: `https://github.com/jcassoutt/Kuzco.git`
 3.  Select the latest version and add the `Kuzco` package to your target.
 
 ### Usage 📝
