@@ -5,14 +5,13 @@ import Foundation
 public actor Kuzco {
     public static let shared = Kuzco()
 
-    private var activeInstances: [String: LlamaInstance] = [:] // Keyed using ModelProfile.id
+    private var activeInstances: [String: LlamaInstance] = [:]
     private var instanceLeaseCount: [String: Int] = [:]
 
     private init() {
         print("🦙 Kuzco Service Initialized 🦙")
     }
 
-    // Returns a tuple containing the LlamaInstance and an AsyncStream for loading progress
     public func instance(
         for profile: ModelProfile,
         settings: InstanceSettings = .standard,
@@ -43,7 +42,6 @@ public actor Kuzco {
         return (newInstance, loadStream)
     }
 
-    // Generates a response stream for a dialogue
     public func predict(
         dialogue: [Turn],
         with modelProfile: ModelProfile,
@@ -61,12 +59,10 @@ public actor Kuzco {
             customStopSequences: customStopSequences
         )
 
-        // Wait for the instance to be ready if it was just created
         if await !llamaInstance.isReady {
             for await progress in loadStream {
                 print("Kuzco Model Loading (\(modelProfile.id)): \(progress.stage) - \(progress.detail ?? "")")
                 if progress.stage == .failed {
-                    // Attempt to release if loading failed.
                     await releaseInstance(for: modelProfile.id, forceShutdown: true)
                     throw KuzcoError.modelInitializationFailed(details: "Loading failed: \(progress.detail ?? "Unknown reason")")
                 }
@@ -74,15 +70,13 @@ public actor Kuzco {
             }
         }
 
-        return await llamaInstance.generate(dialogue: dialogue, overrideConfig: predictionConfig)
+        return await llamaInstance.generate(dialogue: dialogue, overridePredictionConfig: predictionConfig)
     }
 
-    // Releases a lease on a LlamaInstance. If the lease count drops to zero, the instance is shut down.
     public func releaseInstance(for profileID: String, forceShutdown: Bool = false) async {
-        // Check if instance exists before trying to access lease count or instance itself
         guard let instanceToShutdown = activeInstances[profileID] else { return }
 
-        instanceLeaseCount[profileID, default: 1] -= 1 // Decrement lease count
+        instanceLeaseCount[profileID, default: 1] -= 1
 
         if forceShutdown || instanceLeaseCount[profileID, default: 0] <= 0 {
             await instanceToShutdown.performShutdown()
