@@ -15,7 +15,7 @@ import llama
 @LlamaInstanceActor
 public class LlamaInstance {
     public let profile: ModelProfile
-    private var settings: InstanceSettings
+    internal var settings: InstanceSettings
     private var predictionCfg: PredictionConfig
 
     private var clModel: CLlamaModel?
