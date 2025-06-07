@@ -73,7 +73,7 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        File System                                  │
 │                                                                     │
-│  📁 Your App Bundle/Documents    📁 App Support (Cache)            │
+│  Your App Bundle/Documents     App Support (Cache)                  │
 │  ├── model1.gguf (4.2GB)       ├── KuzcoModelCache/                 │
 │  ├── model2.gguf (7.1GB)       │   ├── cached_model_1.kuzco_cache   │
 │  └── model3.gguf (2.8GB)       │   ├── cached_model_2.kuzco_cache   │
