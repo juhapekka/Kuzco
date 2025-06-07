@@ -6,9 +6,3 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
-
-# Cursor IDE files (keep private)
-.cursor-rules
-.cursorrules
-.cursor/
-.cursorignore
