@@ -203,7 +203,39 @@ public class LlamaInstance {
         overridePredictionConfig: PredictionConfig? = nil,
         overrideContextLength: UInt32? = nil
     ) -> AsyncThrowingStream<String, Error> {
+        // Backward compatibility wrapper - just extracts content from StreamResponse
+        return AsyncThrowingStream { continuation in
+            Task { @LlamaInstanceActor [] in
+                do {
+                    for try await response in self.generateWithCompletionInfo(
+                        dialogue: dialogue,
+                        overrideSystemPrompt: overrideSystemPrompt,
+                        overridePredictionConfig: overridePredictionConfig,
+                        overrideContextLength: overrideContextLength
+                    ) {
+                        if !response.content.isEmpty {
+                            continuation.yield(response.content)
+                        }
+                        if response.isComplete {
+                            continuation.finish()
+                            return
+                        }
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func generateWithCompletionInfo(
+        dialogue: [Turn],
+        overrideSystemPrompt: String? = nil,
+        overridePredictionConfig: PredictionConfig? = nil,
+        overrideContextLength: UInt32? = nil
+    ) -> AsyncThrowingStream<StreamResponse, Error> {
         interruptFlag = false
+
 
         let effectiveSystemPrompt = overrideSystemPrompt
         let effectivePredictionConfig = overridePredictionConfig ?? self.predictionCfg
@@ -274,16 +306,25 @@ public class LlamaInstance {
                             try LlamaKitBridge.processBatch(context: context, batch: self.clBatch!)
                             kvCachePosition += physicalBatchTokenCount
                             evalIndex = batchEndIndex
-                            if self.interruptFlag { throw KuzcoError.operationInterrupted }
+                            if self.interruptFlag { 
+                                continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .userStopped))
+                                continuation.finish()
+                                return
+                            }
                         }
                     }
 
                     var generatedStringAccumulator = ""
                     var tokensGeneratedThisTurn = 0
                     let allStopSequences = self.eosHandler.getAllEffectiveStopSequences()
+                    let maxTokensForThisGeneration = effectivePredictionConfig.maxOutputTokens_effective(actualMaxContextForThisCall - UInt32(kvCachePosition))
 
-                    while tokensGeneratedThisTurn < effectivePredictionConfig.maxOutputTokens_effective(actualMaxContextForThisCall - UInt32(kvCachePosition)) {
-                        if self.interruptFlag { throw KuzcoError.operationInterrupted }
+                    while tokensGeneratedThisTurn < maxTokensForThisGeneration {
+                        if self.interruptFlag { 
+                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .userStopped))
+                            continuation.finish()
+                            return
+                        }
                         guard self.clBatch != nil else { throw KuzcoError.engineNotReady }
                         guard let logits = LlamaKitBridge.getLogitsOutput(context: context, fromBatchTokenIndex: self.clBatch!.n_tokens - 1 ) else {
                             throw KuzcoError.predictionFailed(details: "Failed to retrieve logits.")
@@ -292,12 +333,15 @@ public class LlamaInstance {
                         let sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
 
                         if LlamaKitBridge.isEndOfGenerationToken(model: model, token: sampledToken) {
-                            break
+                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
+                            continuation.finish()
+                            return
                         }
 
                         let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
                         var pieceToYield = piece
                         var stopForThisToken = false
+                        var foundStopSequence: String? = nil
 
                         if !allStopSequences.isEmpty {
                             let checkBuffer = generatedStringAccumulator + piece
@@ -321,16 +365,23 @@ public class LlamaInstance {
                                         }
                                     }
                                     stopForThisToken = true
+                                    foundStopSequence = stopSeq
                                     print("🦙 Kuzco - Stopped by antiprompt '\(stopSeq)' (piece: \"\(piece)\", yielded: \"\(pieceToYield)\") 🦙")
                                     break
                                 }
                             }
                         }
 
-                        if !pieceToYield.isEmpty { continuation.yield(pieceToYield) }
+                        if !pieceToYield.isEmpty { 
+                            continuation.yield(StreamResponse(content: pieceToYield, isComplete: false))
+                        }
                         generatedStringAccumulator += piece
 
-                        if stopForThisToken { break }
+                        if stopForThisToken { 
+                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .stopSequenceFound(foundStopSequence!)))
+                            continuation.finish()
+                            return
+                        }
 
                         self.currentContextTokens.append(sampledToken)
                         guard self.clBatch != nil else { throw KuzcoError.batchCreationFailed }
@@ -345,15 +396,22 @@ public class LlamaInstance {
 
                         if kvCachePosition >= actualMaxContextForThisCall {
                             print("🦙 Kuzco - Context limit (\(actualMaxContextForThisCall)) reached during generation 🦙")
-                            break
+                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .contextWindowFull))
+                            continuation.finish()
+                            return
                         }
                         await Task.yield()
                     }
+                    
+                    // If we reach here, we hit the max tokens limit
+                    continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .maxTokensReached))
                     continuation.finish()
 
                 } catch let error as KuzcoError {
+                    continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .error(error.localizedDescription)))
                     continuation.finish(throwing: error)
                 } catch {
+                    continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .error(error.localizedDescription)))
                     continuation.finish(throwing: KuzcoError.unknown(details: error.localizedDescription))
                 }
             }

@@ -99,6 +99,37 @@ public actor Kuzco {
         return await llamaInstance.generate(dialogue: dialogue, overridePredictionConfig: predictionConfig)
     }
 
+    public func predictWithCompletionInfo(
+        dialogue: [Turn],
+        with modelProfile: ModelProfile,
+        instanceSettings: InstanceSettings = .standard,
+        predictionConfig: PredictionConfig = .balanced,
+        formatter: InteractionFormatting? = nil,
+        customStopSequences: [String] = []
+    ) async throws -> AsyncThrowingStream<StreamResponse, Error> {
+
+        let (llamaInstance, loadStream) = await instance(
+            for: modelProfile,
+            settings: instanceSettings,
+            predictionConfig: predictionConfig,
+            formatter: formatter,
+            customStopSequences: customStopSequences
+        )
+
+        if await !llamaInstance.isReady {
+            for await progress in loadStream {
+                print("Kuzco Model Loading (\(modelProfile.id)): \(progress.stage) - \(progress.detail ?? "")")
+                if progress.stage == .failed {
+                    await releaseInstance(for: modelProfile.id, forceShutdown: true)
+                    throw KuzcoError.modelInitializationFailed(details: "Loading failed: \(progress.detail ?? "Unknown reason")")
+                }
+                if progress.stage == .ready { break }
+            }
+        }
+
+        return await llamaInstance.generateWithCompletionInfo(dialogue: dialogue, overridePredictionConfig: predictionConfig)
+    }
+
     public func releaseInstance(for profileID: String, forceShutdown: Bool = false) async {
         guard let instanceToShutdown = activeInstances[profileID] else { return }
 
