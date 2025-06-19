@@ -11,113 +11,26 @@
 > ⚡ **High Performance**: Optimized for Apple Silicon and Intel Macs  
 > 🎯 **Production Ready**: Built for real-world iOS and macOS applications
 
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Your iOS/macOS App                         │
-└──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Kuzco.shared                               │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
-│  │   predict()     │  │   instance()    │  │ Cache Management    │  │
-│  │   ↓             │  │   ↓             │  │ ↓                   │  │
-│  │ • Dialogue      │  │ • ModelProfile  │  │ • clearCache()      │  │
-│  │ • Streaming     │  │ • Settings      │  │ • isModelCached()   │  │
-│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
-└─────────────────────┬───────────────────┬───────────────────────────┘
-                      │                   │
-              ┌───────▼──────┐   ┌────────▼────────┐
-              │ Memory Cache │   │   ModelCache    │
-              │  (Runtime)   │   │  (Persistent)   │
-              │              │   │                 │
-              │              │   │                 │ 
-              │ Active       │   │ • Disk Storage  │
-              │ Instances    │   │ • LRU Eviction  │
-              │              │   │ • Validation    │
-              └──────┬───────┘   └────────┬────────┘
-                     │                    │
-                     ▼                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                          LlamaInstance                              │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
-│  │ Model Loading   │  │ Context Mgmt    │  │ Token Generation    │  │
-│  │ • Startup       │  │ • KV Cache      │  │ • Streaming         │  │
-│  │ • Pre-warming   │  │ • Batching      │  │ • Stop Sequences    │  │
-│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         LlamaKitBridge                              │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
-│  │ Model Ops       │  │ Context Ops     │  │ Token Ops           │  │
-│  │ • Load/Free     │  │ • Create/Free   │  │ • Tokenize          │  │
-│  │ • Memory Map    │  │ • Batch Proc    │  │ • Detokenize        │  │
-│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                           llama.cpp                                 │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
-│  │ GGUF Parser     │  │ Inference Eng   │  │ Hardware Accel      │  │
-│  │ • Model Format  │  │ • Transformer   │  │ • Metal (GPU)       │  │
-│  │ • Quantization  │  │ • Attention     │  │ • CPU Vectorization │  │
-│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                            File System                              │
-│                                                                     │
-│  Your App Bundle/Documents     App Support (Cache)                  │
-│  ├── model1.gguf (4.2GB)       ├── KuzcoModelCache/                 │
-│  ├── model2.gguf (7.1GB)       │   ├── cached_model_1.kuzco_cache   │
-│  └── model3.gguf (2.8GB)       │   ├── cached_model_2.kuzco_cache   │
-│                                │   └── kuzco_cache_metadata.json    │
-└─────────────────────────────────────────────────────────────────────┘
-
-📊 Data Flow:
-┌─────┐    ┌─────────┐    ┌──────────┐    ┌─────────────┐    ┌─────────┐
-│User │───▶│ Kuzco   │───▶│ Instance │───▶│ Bridge      │───▶│llama.cpp│
-│Call │    │ Manager │    │ (Cached) │    │ (C++ Wrap)  │    │ Engine  │
-└─────┘    └─────────┘    └──────────┘    └─────────────┘    └─────────┘
-              │ ▲
-              ▼ │ 🔄 Cache Hit: ~1-3 seconds
-        ┌─────────────┐ 
-        │ ModelCache  │ 
-        │ (Persistent)│ 
-        └─────────────┘ 
-              │
-              ▼ 💾 Cache Miss: Load from .gguf (~10-30 seconds)
-        ┌─────────────┐
-        │ Disk Storage│
-        │(.gguf files)│
-        └─────────────┘
-```
-
 ## ✨ Key Features
 
 ### 🚀 **Core Capabilities**
 - **Local LLM Execution**: Run powerful language models entirely on-device using `llama.cpp`
-- **Multiple Model Architectures**: Support for LLaMA, Mistral, Phi, Gemma, and OpenChat models
+- **Multiple Model Architectures**: Support for LLaMA, Mistral, Phi, Gemma, Qwen, and more
 - **Async/Await Native**: Modern Swift concurrency with streaming responses
 - **Cross-Platform**: Works seamlessly on iOS, macOS, and Mac Catalyst
 
 ### ⚙️ **Advanced Configuration**
 - **Flexible Model Settings**: Fine-tune context length, batch size, GPU layers, and CPU threads
-- **Customizable Sampling**: Control temperature, top-K, top-P, repetition penalties, and Mirostat
+- **Customizable Sampling**: Control temperature, top-K, top-P, repetition penalties, and more
 - **Smart Resource Management**: Efficient instance caching and automatic context handling
-- **Pre-warming Engine**: Optional model preloading for faster inference
+- **Automatic Architecture Detection**: Auto-detect model architectures from filenames
 
 ### 🎨 **Developer Experience**
 - **Simple API**: Get started with just a few lines of code
 - **Comprehensive Error Handling**: Detailed error messages and recovery suggestions
 - **Memory Efficient**: Optimized for mobile device constraints
 - **Thread Safe**: Concurrent prediction support
+- **Fallback Support**: Automatic fallback to compatible architectures
 
 ## 📋 Requirements
 
@@ -129,24 +42,15 @@
 
 ## 📦 Installation
 
-### Swift Package Manager (Recommended)
+### Swift Package Manager
 
-#### Via Xcode
-1. Open your project in Xcode
-2. Go to **File** → **Add Package Dependencies**
-3. Enter the repository URL:
-   ```
-   https://github.com/jcassoutt/Kuzco.git
-   ```
-4. Select **Up to Next Major Version** and click **Add Package**
-5. Add `Kuzco` to your target
-
-#### Via Package.swift
 Add Kuzco to your `Package.swift` dependencies:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/jcassoutt/Kuzco.git", from: "1.0.0")
+    .package(path: "./path/to/Kuzco") // For local development
+    // or for remote repository:
+    // .package(url: "https://github.com/yourusername/Kuzco.git", from: "1.0.0")
 ]
 ```
 
@@ -170,30 +74,64 @@ class ChatService {
     private let kuzco = Kuzco.shared
     
     func generateResponse(to userMessage: String) async throws {
-        // 1. Create a model profile
+        // 1. Create a model profile with automatic architecture detection
         let profile = ModelProfile(
-            sourcePath: "/path/to/your/model.gguf",
-            architecture: .llama3
+            id: "my-model",
+            sourcePath: "/path/to/your/model.gguf"
+            // architecture is auto-detected from filename
         )
         
-        // 2. Prepare the conversation
-        let dialogue: [Turn] = [
-            Turn(role: .user, text: userMessage)
-        ]
+        // 2. Get model instance with safe loading
+        let (instance, loadStream) = await kuzco.instance(for: profile)
         
-        // 3. Generate response with streaming
-        let stream = try await kuzco.predict(
-            dialogue: dialogue,
-            with: profile,
-            instanceSettings: .performanceFocused,
-            predictionConfig: .creative
+        // 3. Monitor loading progress
+        for await progress in loadStream {
+            print("Loading: \(progress.stage)")
+            if progress.stage == .ready {
+                break
+            } else if progress.stage == .failed {
+                print("Failed to load: \(progress.detail ?? "Unknown error")")
+                return
+            }
+        }
+        
+        // 4. Create conversation turns
+        let turns = [Turn(role: .user, text: userMessage)]
+        
+        // 5. Generate response with streaming
+        let predictionStream = try await instance.predict(
+            turns: turns,
+            systemPrompt: "You are a helpful assistant."
         )
         
-        // 4. Process the streaming response
-        for try await token in stream {
-            print(token, terminator: "")
+        // 6. Process the streaming response
+        for try await (content, isComplete, _) in predictionStream {
+            print(content, terminator: "")
+            if isComplete { break }
         }
         print() // New line after completion
+    }
+}
+```
+
+### Safe Model Loading
+
+```swift
+// Use the safe loading method for better error handling
+let (instance, result) = await Kuzco.loadModelSafely(
+    profile: profile,
+    settings: .standard
+)
+
+switch result {
+case .success(let loadedInstance):
+    print("✅ Model loaded successfully!")
+    // Use the instance for predictions
+    
+case .failure(let error):
+    print("❌ Model loading failed: \(error.localizedDescription)")
+    if let suggestion = error.recoverySuggestion {
+        print("💡 Suggestion: \(suggestion)")
     }
 }
 ```
@@ -204,10 +142,9 @@ class ChatService {
 // Custom instance settings for better performance
 let customSettings = InstanceSettings(
     contextLength: 4096,
-    batchSize: 512,
+    processingBatchSize: 512,
     gpuOffloadLayers: 35,
-    cpuThreads: 8,
-    useFlashAttention: true
+    cpuThreadCount: 8
 )
 
 // Fine-tuned prediction config
@@ -216,70 +153,53 @@ let customConfig = PredictionConfig(
     topK: 40,
     topP: 0.9,
     repeatPenalty: 1.1,
-    maxTokens: 1024
+    maxNewTokens: 1024
 )
 
 // Use custom configurations
-let stream = try await kuzco.predict(
-    dialogue: dialogue,
-    with: profile,
-    instanceSettings: customSettings,
+let (instance, loadStream) = await kuzco.instance(
+    for: profile,
+    settings: customSettings,
     predictionConfig: customConfig
 )
 ```
 
-### Multi-turn Conversation
-
-```swift
-var conversation: [Turn] = []
-
-// Add user message
-conversation.append(Turn(role: .user, text: "What is machine learning?"))
-
-// Generate and collect AI response
-var aiResponse = ""
-let stream = try await kuzco.predict(
-    dialogue: conversation,
-    with: profile
-)
-
-for try await token in stream {
-    aiResponse += token
-}
-
-// Add AI response to conversation history
-conversation.append(Turn(role: .assistant, text: aiResponse))
-
-// Continue the conversation...
-conversation.append(Turn(role: .user, text: "Can you give me an example?"))
-```
-
 ## 🧠 Supported Model Architectures
 
-Kuzco supports multiple popular LLM architectures with optimized prompt formatting:
+Kuzco supports multiple popular LLM architectures with automatic detection and optimized prompt formatting:
 
-| Architecture | Models | Prompt Format |
-|-------------|---------|---------------|
-| **LLaMA 3** | Llama 3, Llama 3.1, Llama 3.2 | Optimized Llama 3 format |
-| **LLaMA General** | Llama 2, Code Llama | Standard Llama format |
-| **Mistral Instruct** | Mistral 7B, Mixtral 8x7B | Mistral chat format |
-| **Phi** | Phi-3, Phi-3.5 | Microsoft Phi format |
-| **Gemma** | Gemma 2B, Gemma 7B | Google Gemma format |
-| **OpenChat** | OpenChat models | OpenChat conversation format |
+| Architecture | Models | Auto-Detection Keywords | Prompt Format |
+|-------------|---------|------------------------|---------------|
+| **LLaMA 3** | Llama 3, Llama 3.1, Llama 3.2 | `llama-3`, `llama3` | LLaMA 3 format |
+| **LLaMA General** | Llama 2, Code Llama | `llama`, `codellama` | Standard LLaMA format |
+| **Qwen** | Qwen2, Qwen3 | `qwen2`, `qwen3` | ChatML format |
+| **Mistral** | Mistral 7B, Mixtral 8x7B | `mistral`, `mixtral` | Mistral chat format |
+| **Phi** | Phi-3, Phi-3.5 | `phi` | Microsoft Phi format |
+| **Gemma** | Gemma 2B, Gemma 7B | `gemma` | Google Gemma format |
+| **DeepSeek** | DeepSeek models | `deepseek` | DeepSeek format |
+| **Command-R** | Command-R models | `command-r`, `commandr` | Command-R format |
+| **Yi** | Yi models | `yi-` | ChatML format |
+| **OpenChat** | OpenChat models | `openchat` | ChatML format |
 
-### Adding Your Model
+### Manual Architecture Specification
 
 ```swift
-// For a LLaMA 3 model
+// Explicitly specify architecture when auto-detection isn't sufficient
 let profile = ModelProfile(
-    sourcePath: "/path/to/llama3-8b.gguf",
-    architecture: .llama3
+    id: "my-model",
+    sourcePath: "/path/to/model.gguf",
+    architecture: .qwen3
 )
+```
 
-// For a Mistral model
-let profile = ModelProfile(
-    sourcePath: "/path/to/mistral-7b-instruct.gguf",
-    architecture: .mistralInstruct
+### Fallback Support
+
+```swift
+// Use the safer initialization for better compatibility
+let profile = ModelProfile.createWithFallback(
+    id: "my-model",
+    sourcePath: "/path/to/qwen3-model.gguf"
+    // Automatically falls back to qwen2 if qwen3 is unsupported
 )
 ```
 
@@ -291,12 +211,10 @@ Controls how the model is loaded and executed:
 
 ```swift
 let settings = InstanceSettings(
-    contextLength: 4096,        // Context window size (tokens)
-    batchSize: 512,            // Batch size for processing
-    gpuOffloadLayers: 35,      // Layers to offload to GPU (Metal)
-    cpuThreads: 8,             // CPU threads to use
-    useFlashAttention: true,   // Enable flash attention optimization
-    enableMemoryMapping: true  // Use memory mapping for efficiency
+    contextLength: 4096,           // Context window size (tokens)
+    processingBatchSize: 512,      // Batch size for processing
+    gpuOffloadLayers: 35,          // Layers to offload to GPU (Metal)
+    cpuThreadCount: 8              // CPU threads to use
 )
 ```
 
@@ -306,29 +224,14 @@ Fine-tune the text generation behavior:
 
 ```swift
 let config = PredictionConfig(
-    temperature: 0.7,          // Randomness (0.0 = deterministic, 1.0+ = creative)
-    topK: 40,                 // Top-K sampling
-    topP: 0.9,                // Nucleus sampling
-    repeatPenalty: 1.1,       // Repetition penalty
-    maxTokens: 1024,          // Maximum tokens to generate
-    stopSequences: ["</s>"],  // Stop generation at these sequences
-    enableMirostat: false,    // Enable Mirostat sampling
-    mirostatTau: 5.0,        // Mirostat target entropy
-    mirostatEta: 0.1         // Mirostat learning rate
+    temperature: 0.7,              // Randomness (0.0 = deterministic, 1.0+ = creative)
+    topK: 40,                     // Top-K sampling
+    topP: 0.9,                    // Nucleus sampling
+    repeatPenalty: 1.1,           // Repetition penalty
+    maxNewTokens: 1024,           // Maximum tokens to generate
+    stopSequences: ["</s>"]       // Stop generation at these sequences
 )
 ```
-
-## 📱 Platform Considerations
-
-### iOS Optimization
-- **Memory Management**: Models are automatically unloaded when memory pressure is detected
-- **Background Handling**: Inference pauses when app enters background
-- **Battery Optimization**: Smart CPU/GPU usage based on device capabilities
-
-### macOS Features
-- **Apple Silicon**: Full Metal GPU acceleration on M1/M2/M3 Macs
-- **Intel Macs**: Optimized CPU inference with vectorization
-- **Memory Mapping**: Efficient large model loading
 
 ## 🔧 Troubleshooting
 
@@ -338,60 +241,39 @@ let config = PredictionConfig(
 - Ensure your `.gguf` model file is compatible with llama.cpp
 - Check that the file path is correct and accessible
 - Verify you have enough available RAM for the model
+- Use `profile.validateModelFile()` to check file integrity
+
+**Q: "unknown model architecture" Error**
+- Let Kuzco auto-detect the architecture by not specifying it explicitly
+- Use `ModelProfile.createWithFallback()` for better compatibility
+- Ensure your model filename contains recognizable architecture keywords
 
 **Q: Inference is slow**
 - Increase `gpuOffloadLayers` for Apple Silicon devices
 - Reduce `contextLength` if you don't need large contexts
-- Try `instanceSettings: .performanceFocused`
+- Try `InstanceSettings.standard` or customize settings for your hardware
 
 **Q: Getting memory warnings on iOS**
 - Use smaller quantized models (Q4_0, Q4_1)
-- Reduce `contextLength` and `batchSize`
-- Consider `instanceSettings: .memoryEfficient`
+- Reduce `contextLength` and `processingBatchSize`
+- Monitor memory usage and implement proper cleanup
 
 ### Performance Tips
 
 1. **Model Selection**: Use appropriately sized models for your target devices
 2. **Quantization**: Q4_0 and Q4_1 models offer good quality/size balance
 3. **Context Management**: Only include necessary conversation history
-4. **Pre-warming**: Use `kuzco.prewarm()` for faster first inference
+4. **Caching**: Leverage Kuzco's automatic instance caching
 
-### "unknown model architecture: 'qwen3'" Error
+## 📱 Example Implementation
 
-This error typically occurs when:
-1. The underlying llama.cpp version doesn't support the model architecture
-2. The model file is corrupted or incompatible
+This package includes `ChatPage.swift` as an example of how to integrate Kuzco into a real SwiftUI application, demonstrating:
 
-**Solutions:**
-- Ensure you're using a GGUF format model
-- Try using the automatic architecture detection by not specifying the architecture explicitly
-- Check that the model file is not corrupted
-- For Qwen3 models specifically, ensure you have a recent enough llama.cpp version
-
-**New: Automatic Fallback Support**
-Kuzco now includes automatic fallback mechanisms for unsupported architectures:
-
-```swift
-// Use the safer initialization method for better compatibility
-let profile = ModelProfile.createWithFallback(
-    id: "my-qwen3-model",
-    sourcePath: "/path/to/qwen3-model.gguf"
-    // This will automatically use qwen2 formatting if qwen3 is unsupported
-)
-
-// Or if loading fails, Kuzco will automatically retry with fallback architectures
-let (instance, loadStream) = await Kuzco.shared.instance(for: profile)
-for await progress in loadStream {
-    print("Loading: \(progress.stage) - \(progress.detail ?? "")")
-    if progress.stage == .ready { break }
-}
-```
-
-The fallback system will:
-1. First try the detected architecture (qwen3)
-2. If that fails, automatically retry with qwen2
-3. If qwen2 fails, fall back to unknown/ChatML formatting
-4. Provide clear logging about which fallback is being used
+- Safe model loading with error handling
+- Streaming response generation
+- Conversation continuation
+- Memory management
+- User-friendly error messages
 
 ## 🤝 Contributing
 
@@ -406,8 +288,11 @@ We welcome contributions! Here's how you can help:
 ### Development Setup
 
 ```bash
-git clone https://github.com/jcassoutt/Kuzco.git
+# Clone the repository
+git clone /path/to/Kuzco
 cd Kuzco
+
+# Build and test
 swift build
 swift test
 ```
@@ -422,176 +307,9 @@ This project is licensed under the **Apache License 2.0** - see the [LICENSE](LI
 - **[Georgi Gerganov](https://github.com/ggerganov)** - Creator of llama.cpp
 - **Open Source Community** - For making efficient on-device AI a reality
 
-## 📚 Additional Resources
-
-- 📖 **[API Documentation](https://jcassoutt.github.io/Kuzco/documentation/kuzco/)** - Complete API reference
-- 🧪 **[Example Projects](https://github.com/jcassoutt/Kuzco/tree/main/Examples)** - Sample implementations
-- 💬 **[Discussions](https://github.com/jcassoutt/Kuzco/discussions)** - Community Q&A and feature requests
-- 🐛 **[Issues](https://github.com/jcassoutt/Kuzco/issues)** - Bug reports and feature requests
-
 ---
 
 <div align="center">
   <strong>Built with ❤️ for the Swift community</strong><br>
   <sub>Made by <a href="https://github.com/jaredcassoutt">Jared Cassoutt</a></sub>
 </div>
-
-## Recent Updates
-
-✨ **Enhanced Model Architecture Support**: Kuzco now supports a wide range of model architectures including:
-- Qwen2 and Qwen3 models
-- CodeLlama variants  
-- DeepSeek models
-- Command-R models
-- Yi models
-- Mixtral models
-- And more with automatic architecture detection
-
-🔧 **Improved Error Handling**: Better error messages for unsupported model architectures with helpful suggestions.
-
-🎯 **Dynamic Model Loading**: Automatic architecture detection from model file names with fallback support.
-
-## Features
-
-- **Easy Model Loading**: Automatic architecture detection and configuration
-- **Comprehensive Architecture Support**: Wide range of model architectures with proper prompt formatting
-- **Dynamic Error Handling**: Helpful error messages and suggestions for troubleshooting
-- **Caching System**: Intelligent model caching for faster subsequent loads
-- **SwiftUI Integration**: Ready for use in SwiftUI applications
-
-## Quick Start
-
-### Loading a Model with Automatic Architecture Detection
-
-```swift
-import Kuzco
-
-// Automatic architecture detection from filename
-let modelProfile = ModelProfile(
-    id: "my-qwen3-model",
-    sourcePath: "/path/to/qwen3-8b-instruct.gguf"
-    // architecture will be auto-detected as .qwen3
-)
-
-let (instance, loadStream) = await Kuzco.shared.instance(for: modelProfile)
-
-// Monitor loading progress
-for await progress in loadStream {
-    print("Loading: \(progress.stage) - \(progress.detail ?? "")")
-    if progress.stage == .ready { break }
-}
-```
-
-### Explicit Architecture Specification
-
-```swift
-// Explicitly specify architecture for better control
-let modelProfile = ModelProfile(
-    id: "my-model",
-    sourcePath: "/path/to/model.gguf",
-    architecture: .qwen3
-)
-```
-
-### Handling Different Model Architectures
-
-```swift
-// The library automatically handles prompt formatting for different architectures
-let dialogue = [
-    Turn(role: .user, text: "Hello, how are you?")
-]
-
-let predictionStream = try await Kuzco.shared.predict(
-    dialogue: dialogue,
-    systemPrompt: "You are a helpful assistant.",
-    with: modelProfile
-)
-
-for try await token in predictionStream {
-    print(token, terminator: "")
-}
-```
-
-### Model Validation
-
-```swift
-// Validate model file before loading
-do {
-    try modelProfile.validateModelFile()
-    print("Model file is valid GGUF format")
-} catch {
-    print("Model validation failed: \(error.localizedDescription)")
-    print("Suggestion: \(modelProfile.getArchitectureSuggestions())")
-}
-```
-
-## Supported Model Architectures
-
-| Architecture | Models | Prompt Format |
-|--------------|--------|---------------|
-| `.qwen2`, `.qwen3` | Qwen series | ChatML format |
-| `.llama3` | LLaMA 3 | LLaMA 3 format |
-| `.codellama` | CodeLlama | LLaMA format |
-| `.mistralInstruct`, `.mixtral` | Mistral models | Mistral format |
-| `.deepseek` | DeepSeek models | DeepSeek format |
-| `.commandR` | Command-R models | Command-R format |
-| `.yi` | Yi models | ChatML format |
-| `.phiGeneric` | Phi models | Phi format |
-| `.gemmaInstruct` | Gemma models | Gemma format |
-| `.openChat` | OpenChat models | ChatML format |
-| `.llamaGeneral` | General LLaMA | LLaMA format |
-| `.unknown` | Auto-fallback | ChatML format |
-
-## Error Handling
-
-If you encounter model loading errors, Kuzco provides helpful error messages:
-
-```swift
-do {
-    let (instance, loadStream) = await Kuzco.shared.instance(for: modelProfile)
-    // ... handle loading
-} catch let error as KuzcoError {
-    switch error {
-    case .unsupportedModelArchitecture(let arch, let suggestion):
-        print("Unsupported architecture '\(arch)': \(suggestion)")
-    case .modelInitializationFailed(let details):
-        print("Model failed to load: \(details)")
-    default:
-        print("Error: \(error.localizedDescription)")
-    }
-}
-```
-
-## Common Issues and Solutions
-
-### "unknown model architecture: 'qwen3'" Error
-
-This error typically occurs when:
-1. The underlying llama.cpp version doesn't support the model architecture
-2. The model file is corrupted or incompatible
-
-**Solutions:**
-- Ensure you're using a GGUF format model
-- Try using the automatic architecture detection by not specifying the architecture explicitly
-- Check that the model file is not corrupted
-- For Qwen3 models specifically, ensure you have a recent enough llama.cpp version
-
-### Model File Not Loading
-
-1. **Check file path**: Ensure the file path is correct and accessible
-2. **Validate format**: Use `modelProfile.validateModelFile()` to check if it's a valid GGUF file
-3. **Check architecture**: Let Kuzco auto-detect the architecture or specify it explicitly
-
-### Performance Optimization
-
-- Use model caching to avoid reloading the same models
-- Adjust instance settings for your hardware capabilities
-- Consider using smaller quantized models for faster inference
-
-## Contributing
-
-We welcome contributions! Please feel free to submit issues and pull requests.
-
-## License
-
-This project is licensed under the Apache 2.0 License.
