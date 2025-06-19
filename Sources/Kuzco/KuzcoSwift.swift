@@ -2,6 +2,36 @@
 // https://docs.swift.org/swift-book
 import Foundation
 
+/// Result type for safe model loading operations
+public enum LoadResult {
+    case success(LlamaInstance)
+    case failure(KuzcoError)
+    
+    /// Returns true if the load was successful
+    public var isSuccess: Bool {
+        switch self {
+        case .success: return true
+        case .failure: return false
+        }
+    }
+    
+    /// Returns the error if load failed, nil if successful
+    public var error: KuzcoError? {
+        switch self {
+        case .success: return nil
+        case .failure(let error): return error
+        }
+    }
+    
+    /// Returns the instance if load was successful, nil if failed
+    public var instance: LlamaInstance? {
+        switch self {
+        case .success(let instance): return instance
+        case .failure: return nil
+        }
+    }
+}
+
 public actor Kuzco {
     public static let shared = Kuzco()
 
@@ -66,82 +96,120 @@ public actor Kuzco {
         }
 
         // Create new instance with fallback handling
-        var currentInstance = await LlamaInstance(
-            profile: finalProfile,
-            settings: settings,
-            predictionConfig: predictionConfig,
-            formatter: formatter,
-            customStopSequences: customStopSequences
-        )
-        activeInstances[finalProfile.id] = currentInstance
-        instanceLeaseCount[finalProfile.id, default: 0] = 1
-
-        let loadStream = await currentInstance.startup()
-        
-        // Check if startup failed due to unsupported architecture and try fallback
-        let fallbackStream = AsyncStream<LoadUpdate> { continuation in
-            Task {
-                var lastUpdate: LoadUpdate?
-                for await update in loadStream {
-                    lastUpdate = update
-                    continuation.yield(update)
-                    
-                    // If loading failed due to unsupported architecture, try fallback
-                    if update.stage == .failed && 
-                       (update.detail?.contains("unsupported model architecture") == true ||
-                        update.detail?.contains("qwen3") == true ||
-                        update.detail?.contains("qwen2") == true) {
-                        
-                        print("🦙 Kuzco - Attempting fallback for unsupported architecture: \(finalProfile.architecture.rawValue)")
-                        
-                        // Try with a fallback architecture
-                        let fallbackArch = finalProfile.architecture.getFallbackArchitecture()
-                        
-                        let fallbackProfile = ModelProfile(
-                            id: finalProfile.id,
-                            sourcePath: finalProfile.sourcePath,
-                            architecture: fallbackArch
-                        )
-                        
-                        continuation.yield(LoadUpdate(stage: .preparing, detail: "Retrying with fallback architecture: \(fallbackArch.rawValue)"))
-                        
-                        // Remove the failed instance
-                        activeInstances.removeValue(forKey: finalProfile.id)
-                        instanceLeaseCount.removeValue(forKey: finalProfile.id)
-                        await currentInstance.performShutdown()
-                        
-                        // Create new instance with fallback
-                        let fallbackInstance = await LlamaInstance(
-                            profile: fallbackProfile,
-                            settings: settings,
-                            predictionConfig: predictionConfig,
-                            formatter: formatter,
-                            customStopSequences: customStopSequences
-                        )
-                        activeInstances[finalProfile.id] = fallbackInstance
-                        instanceLeaseCount[finalProfile.id, default: 0] = 1
-                        currentInstance = fallbackInstance
-                        
-                        // Try loading with fallback
-                        let fallbackLoadStream = await fallbackInstance.startup()
-                        for await fallbackUpdate in fallbackLoadStream {
-                            continuation.yield(fallbackUpdate)
-                            if fallbackUpdate.stage == .ready || fallbackUpdate.stage == .failed {
-                                break
-                            }
-                        }
-                        break
-                    }
-                    
-                    if update.stage == .ready || update.stage == .failed {
-                        break
-                    }
+        do {
+            let newInstance = await LlamaInstance(
+                profile: finalProfile,
+                settings: settings,
+                predictionConfig: predictionConfig,
+                formatter: formatter,
+                customStopSequences: customStopSequences
+            )
+            
+            let loadStream = await newInstance.startup()
+            activeInstances[finalProfile.id] = newInstance
+            instanceLeaseCount[finalProfile.id, default: 0] = 1
+            
+            return (newInstance, loadStream)
+            
+        } catch let error as KuzcoError {
+            // Handle specific error types with helpful guidance
+            print("🦙 Kuzco - Instance creation failed: \(error.localizedDescription) 🦙")
+            
+            // Create error stream with recovery suggestions
+            let errorStream = AsyncStream<LoadUpdate> { continuation in
+                var errorDetail = error.localizedDescription
+                if let suggestion = error.recoverySuggestion {
+                    errorDetail += "\n\nSuggestion: \(suggestion)"
                 }
+                
+                continuation.yield(LoadUpdate(
+                    stage: .failed,
+                    detail: errorDetail,
+                    hasError: true
+                ))
                 continuation.finish()
             }
+            
+            // Create a placeholder instance that will fail gracefully
+            let failedInstance = await LlamaInstance(
+                profile: finalProfile,
+                settings: InstanceSettings(contextLength: 512, processingBatchSize: 32),
+                predictionConfig: predictionConfig,
+                formatter: formatter,
+                customStopSequences: customStopSequences
+            )
+            
+            return (failedInstance, errorStream)
+            
+        } catch {
+            print("🦙 Kuzco - Unexpected error during instance creation: \(error.localizedDescription) 🦙")
+            
+            let errorStream = AsyncStream<LoadUpdate> { continuation in
+                continuation.yield(LoadUpdate(
+                    stage: .failed,
+                    detail: "Unexpected error: \(error.localizedDescription)",
+                    hasError: true
+                ))
+                continuation.finish()
+            }
+            
+            let failedInstance = await LlamaInstance(
+                profile: finalProfile,
+                settings: InstanceSettings(contextLength: 512, processingBatchSize: 32),
+                predictionConfig: predictionConfig,
+                formatter: formatter,
+                customStopSequences: customStopSequences
+            )
+            
+            return (failedInstance, errorStream)
         }
+    }
+
+    /// Safe model loading with comprehensive error handling and fallback options
+    public static func loadModelSafely(
+        profile: ModelProfile,
+        settings: InstanceSettings = .standard,
+        predictionConfig: PredictionConfig = .balanced,
+        formatter: InteractionFormatting? = nil,
+        customStopSequences: [String] = []
+    ) async -> (instance: LlamaInstance?, loadResult: LoadResult) {
         
-        return (currentInstance, fallbackStream)
+        do {
+            // Pre-validate the model
+            try LlamaKitBridge.validateModelFile(path: profile.sourcePath)
+            
+            let (instance, stream) = await Kuzco.shared.instance(
+                for: profile,
+                settings: settings,
+                predictionConfig: predictionConfig,
+                formatter: formatter,
+                customStopSequences: customStopSequences
+            )
+            
+            // Collect the load results
+            var finalUpdate: LoadUpdate?
+            for await update in stream {
+                finalUpdate = update
+                if update.stage == .ready || update.stage == .failed {
+                    break
+                }
+            }
+            
+            if let update = finalUpdate {
+                if update.stage == .ready {
+                    return (instance, .success(instance))
+                } else {
+                    return (nil, .failure(KuzcoError.modelInitializationFailed(details: update.detail ?? "")))
+                }
+            } else {
+                return (nil, .failure(KuzcoError.unknown(details: "No load update received")))
+            }
+            
+        } catch let error as KuzcoError {
+            return (nil, .failure(error))
+        } catch {
+            return (nil, .failure(KuzcoError.unknown(details: error.localizedDescription)))
+        }
     }
 
     /// Predict with a given dialogue and a required system prompt.
