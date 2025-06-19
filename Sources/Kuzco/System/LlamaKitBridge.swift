@@ -22,39 +22,158 @@ enum LlamaKitBridge {
         llama_backend_free()
     }
 
-    static func loadModel(from path: String, settings: InstanceSettings) throws -> CLlamaModel {
-        var mparams = llama_model_default_params()
-        mparams.n_gpu_layers = settings.offloadedGpuLayers
-        mparams.use_mmap = settings.enableMemoryMapping
-        mparams.use_mlock = settings.enableMemoryLocking
-
-        guard let modelPtr = llama_load_model_from_file(path, mparams) else {
-            throw KuzcoError.modelInitializationFailed(details: "llama_load_model_from_file returned null for path \(path).")
+    /// Validates a model file before attempting to load it
+    static func validateModelFile(path: String) throws {
+        // Check if file exists
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw KuzcoError.modelFileNotAccessible(path: path)
         }
-        return modelPtr
+        
+        // Check file size (must be at least 1MB for a valid model)
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: path)
+            if let fileSize = attributes[.size] as? UInt64, fileSize < 1_048_576 {
+                throw KuzcoError.modelInitializationFailed(details: "Model file is too small (\(fileSize) bytes). Minimum expected size is 1MB.")
+            }
+        } catch {
+            throw KuzcoError.modelFileNotAccessible(path: path)
+        }
+        
+        // Validate GGUF magic bytes
+        guard let fileHandle = FileHandle(forReadingAtPath: path) else {
+            throw KuzcoError.modelFileNotAccessible(path: path)
+        }
+        
+        defer { fileHandle.closeFile() }
+        
+        do {
+            let magicBytes = fileHandle.readData(ofLength: 4)
+            let expectedMagic = "GGUF".data(using: .ascii)!
+            
+            if magicBytes.count < 4 || magicBytes != expectedMagic {
+                throw KuzcoError.configurationInvalid(reason: "Model file does not appear to be a valid GGUF format. Expected magic bytes 'GGUF', but found different format.")
+            }
+        } catch {
+            throw KuzcoError.modelInitializationFailed(details: "Failed to read model file header: \(error.localizedDescription)")
+        }
+    }
+
+    static func loadModel(from path: String, settings: InstanceSettings) throws -> CLlamaModel {
+        // Pre-validate the model file
+        try validateModelFile(path: path)
+        
+        // Wrap the actual loading in error handling
+        do {
+            var mparams = llama_model_default_params()
+            mparams.n_gpu_layers = settings.offloadedGpuLayers
+            mparams.use_mmap = settings.enableMemoryMapping
+            mparams.use_mlock = settings.enableMemoryLocking
+
+            print("🦙 Kuzco - Attempting to load model from: \(path) 🦙")
+            print("🦙 GPU layers: \(settings.offloadedGpuLayers), mmap: \(settings.enableMemoryMapping), mlock: \(settings.enableMemoryLocking) 🦙")
+            
+            guard let modelPtr = llama_load_model_from_file(path, mparams) else {
+                // Enhanced error handling with architecture detection
+                let fileName = (path as NSString).lastPathComponent.lowercased()
+                
+                if fileName.contains("qwen3") || fileName.contains("qwen2") {
+                    let architecture = fileName.contains("qwen3") ? "qwen3" : "qwen2"
+                    throw KuzcoError.unsupportedModelArchitecture(
+                        architecture: architecture,
+                        suggestedAction: "Your version of llama.cpp doesn't support \(architecture) architecture. The model will still work but may use fallback formatting. Consider updating llama.cpp or using a compatible model format. Kuzco will attempt to handle this model with ChatML formatting."
+                    )
+                } else if fileName.contains("deepseek") {
+                    throw KuzcoError.unsupportedModelArchitecture(
+                        architecture: "deepseek",
+                        suggestedAction: "DeepSeek models require specific llama.cpp support. Try using a different model or updating to a more recent version of llama.cpp."
+                    )
+                } else if fileName.contains("claude") || fileName.contains("gpt") {
+                    throw KuzcoError.configurationInvalid(reason: "This appears to be a commercial model format that cannot be loaded with llama.cpp. Please use a GGUF-format open source model.")
+                } else {
+                    throw KuzcoError.modelInitializationFailed(details: "llama_load_model_from_file returned null for path \(path). This could be due to: 1) Unsupported model architecture, 2) Corrupted model file, 3) Insufficient memory, 4) Invalid GGUF format. Try using a different model or check the file integrity.")
+                }
+            }
+            
+            print("🦙 Kuzco - Model loaded successfully 🦙")
+            return modelPtr
+            
+        } catch let error as KuzcoError {
+            // Re-throw our custom errors
+            throw error
+        } catch {
+            // Catch any unexpected errors from llama.cpp
+            throw KuzcoError.modelInitializationFailed(details: "Unexpected error during model loading: \(error.localizedDescription)")
+        }
+    }
+
+    /// Attempts to load a model with fallback approaches for unsupported architectures
+    static func loadModelWithFallback(from path: String, settings: InstanceSettings, fallbackArchitecture: ModelArchitecture? = nil) throws -> CLlamaModel {
+        do {
+            return try loadModel(from: path, settings: settings)
+        } catch let error as KuzcoError {
+            print("🦙 Kuzco - Primary model load failed: \(error.localizedDescription) 🦙")
+            
+            // Try with reduced GPU layers as fallback
+            if case .unsupportedModelArchitecture = error, settings.offloadedGpuLayers > 0 {
+                print("🦙 Kuzco - Attempting fallback with CPU-only processing 🦙")
+                var fallbackSettings = settings
+                fallbackSettings.offloadedGpuLayers = 0
+                
+                do {
+                    return try loadModel(from: path, settings: fallbackSettings)
+                } catch {
+                    print("🦙 Kuzco - Fallback also failed 🦙")
+                    throw error
+                }
+            }
+            
+            // For unsupported architecture errors, we'll let the higher level handle fallback
+            throw error
+        }
     }
 
     static func freeModel(_ model: CLlamaModel) {
-        llama_free_model(model)
+        do {
+            llama_free_model(model)
+            print("🦙 Kuzco - Model freed successfully 🦙")
+        } catch {
+            print("🦙 Kuzco - Warning: Error freeing model: \(error.localizedDescription) 🦙")
+        }
     }
 
     static func createContext(for model: CLlamaModel, settings: InstanceSettings) throws -> CLlamaContext {
-        var cparams = llama_context_default_params()
-        cparams.n_ctx = settings.contextLength
-        cparams.n_batch = settings.processingBatchSize
-        cparams.n_ubatch = settings.processingBatchSize
-        cparams.flash_attn = settings.useFlashAttention
-        cparams.n_threads = settings.cpuThreadCount
-        cparams.n_threads_batch = settings.cpuThreadCount
+        do {
+            var cparams = llama_context_default_params()
+            cparams.n_ctx = settings.contextLength
+            cparams.n_batch = settings.processingBatchSize
+            cparams.n_ubatch = settings.processingBatchSize
+            cparams.flash_attn = settings.useFlashAttention
+            cparams.n_threads = settings.cpuThreadCount
+            cparams.n_threads_batch = settings.cpuThreadCount
 
-        guard let contextPtr = llama_new_context_with_model(model, cparams) else {
-            throw KuzcoError.contextCreationFailed(details: "llama_new_context_with_model returned null.")
+            print("🦙 Kuzco - Creating context with: ctx=\(settings.contextLength), batch=\(settings.processingBatchSize), threads=\(settings.cpuThreadCount) 🦙")
+
+            guard let contextPtr = llama_new_context_with_model(model, cparams) else {
+                throw KuzcoError.contextCreationFailed(details: "llama_new_context_with_model returned null. This may be due to insufficient memory or invalid context parameters.")
+            }
+            
+            print("🦙 Kuzco - Context created successfully 🦙")
+            return contextPtr
+            
+        } catch let error as KuzcoError {
+            throw error
+        } catch {
+            throw KuzcoError.contextCreationFailed(details: "Unexpected error during context creation: \(error.localizedDescription)")
         }
-        return contextPtr
     }
 
     static func freeContext(_ context: CLlamaContext) {
-        llama_free(context)
+        do {
+            llama_free(context)
+            print("🦙 Kuzco - Context freed successfully 🦙")
+        } catch {
+            print("🦙 Kuzco - Warning: Error freeing context: \(error.localizedDescription) 🦙")
+        }
     }
 
     static func getModelMaxContextLength(context: CLlamaContext) -> UInt32 {
@@ -72,7 +191,10 @@ enum LlamaKitBridge {
         let count = llama_tokenize(model, text, Int32(text.utf8.count), &tokens, Int32(maxTokenCount), addBos, parseSpecial)
 
         if count < 0 {
-            throw KuzcoError.tokenizationFailed(details: "llama_tokenize returned \(count).")
+            // Add more detailed error information
+            let errorDetails = "llama_tokenize returned \(count) for text length \(text.utf8.count), maxTokens: \(maxTokenCount), addBos: \(addBos), parseSpecial: \(parseSpecial)"
+            print("🦙 KuzcoBridge Tokenization Error: \(errorDetails) 🦙")
+            throw KuzcoError.tokenizationFailed(details: errorDetails)
         }
         return Array(tokens.prefix(Int(count)))
     }
@@ -134,48 +256,95 @@ enum LlamaKitBridge {
     }
 
     static func processBatch(context: CLlamaContext, batch: CLlamaBatch) throws {
-        let result = llama_decode(context, batch)
-        if result != 0 {
-            throw KuzcoError.predictionFailed(details: "llama_decode returned \(result).")
+        do {
+            let result = llama_decode(context, batch)
+            if result != 0 {
+                let errorMsg = "llama_decode returned \(result). This may indicate insufficient memory, invalid batch, or model corruption."
+                print("🦙 KuzcoBridge Batch Processing Error: \(errorMsg) 🦙")
+                throw KuzcoError.predictionFailed(details: errorMsg)
+            }
+        } catch let error as KuzcoError {
+            throw error
+        } catch {
+            throw KuzcoError.predictionFailed(details: "Unexpected error during batch processing: \(error.localizedDescription)")
         }
     }
 
     static func getLogitsOutput(context: CLlamaContext, fromBatchTokenIndex index: Int32) -> UnsafeMutablePointer<Float>? {
-        return llama_get_logits_ith(context, index)
+        do {
+            return llama_get_logits_ith(context, index)
+        } catch {
+            print("🦙 KuzcoBridge Warning: Error getting logits: \(error.localizedDescription) 🦙")
+            return nil
+        }
     }
     
     static func clearKeyValueCache(context: CLlamaContext) {
-        llama_kv_cache_clear(context)
+        do {
+            llama_kv_cache_clear(context)
+            print("🦙 Kuzco - KV cache cleared successfully 🦙")
+        } catch {
+            print("🦙 Kuzco - Warning: Error clearing KV cache: \(error.localizedDescription) 🦙")
+        }
     }
 
     static func removeTokensFromKeyValueCache(context: CLlamaContext, sequenceId: Int32, fromPosition start: Int32, toPosition end: Int32) {
-        llama_kv_cache_seq_rm(context, llama_seq_id(sequenceId), llama_pos(start), llama_pos(end))
+        do {
+            llama_kv_cache_seq_rm(context, llama_seq_id(sequenceId), llama_pos(start), llama_pos(end))
+        } catch {
+            print("🦙 Kuzco - Warning: Error removing tokens from KV cache: \(error.localizedDescription) 🦙")
+        }
     }
 
     static func sampleTokenGreedy(model: CLlamaModel, context: CLlamaContext, logits: UnsafeMutablePointer<Float>) -> CLlamaToken {
-        let vocabSize = llama_n_vocab(model)
-        
-        var maxLogit: Float = -Float.infinity
-        var bestToken: CLlamaToken = 0
-        
-        for i in 0..<Int(vocabSize) {
-            if logits[i] > maxLogit {
-                maxLogit = logits[i]
-                bestToken = CLlamaToken(i)
+        do {
+            let vocabSize = llama_n_vocab(model)
+            
+            guard vocabSize > 0 else {
+                print("🦙 KuzcoBridge Error: Invalid vocabulary size: \(vocabSize) 🦙")
+                return 0
             }
+            
+            var maxLogit: Float = -Float.infinity
+            var bestToken: CLlamaToken = 0
+            
+            for i in 0..<Int(vocabSize) {
+                if logits[i] > maxLogit {
+                    maxLogit = logits[i]
+                    bestToken = CLlamaToken(i)
+                }
+            }
+            return bestToken
+        } catch {
+            print("🦙 KuzcoBridge Error: Exception during token sampling: \(error.localizedDescription) 🦙")
+            return 0
         }
-        return bestToken
     }
 
     static func getBosToken(model: CLlamaModel) -> CLlamaToken {
-        return llama_token_bos(model)
+        do {
+            return llama_token_bos(model)
+        } catch {
+            print("🦙 KuzcoBridge Warning: Error getting BOS token: \(error.localizedDescription) 🦙")
+            return 1 // Common fallback BOS token ID
+        }
     }
 
     static func getEosToken(model: CLlamaModel) -> CLlamaToken {
-        return llama_token_eos(model)
+        do {
+            return llama_token_eos(model)
+        } catch {
+            print("🦙 KuzcoBridge Warning: Error getting EOS token: \(error.localizedDescription) 🦙")
+            return 2 // Common fallback EOS token ID
+        }
     }
 
     static func isEndOfGenerationToken(model: CLlamaModel, token: CLlamaToken) -> Bool {
-        return token == llama_token_eos(model) || llama_token_is_eog(model, token)
+        do {
+            return token == llama_token_eos(model) || llama_token_is_eog(model, token)
+        } catch {
+            print("🦙 KuzcoBridge Warning: Error checking EOG token: \(error.localizedDescription) 🦙")
+            return token == 2 // Fallback check for common EOS token
+        }
     }
 }

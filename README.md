@@ -356,6 +356,43 @@ let config = PredictionConfig(
 3. **Context Management**: Only include necessary conversation history
 4. **Pre-warming**: Use `kuzco.prewarm()` for faster first inference
 
+### "unknown model architecture: 'qwen3'" Error
+
+This error typically occurs when:
+1. The underlying llama.cpp version doesn't support the model architecture
+2. The model file is corrupted or incompatible
+
+**Solutions:**
+- Ensure you're using a GGUF format model
+- Try using the automatic architecture detection by not specifying the architecture explicitly
+- Check that the model file is not corrupted
+- For Qwen3 models specifically, ensure you have a recent enough llama.cpp version
+
+**New: Automatic Fallback Support**
+Kuzco now includes automatic fallback mechanisms for unsupported architectures:
+
+```swift
+// Use the safer initialization method for better compatibility
+let profile = ModelProfile.createWithFallback(
+    id: "my-qwen3-model",
+    sourcePath: "/path/to/qwen3-model.gguf"
+    // This will automatically use qwen2 formatting if qwen3 is unsupported
+)
+
+// Or if loading fails, Kuzco will automatically retry with fallback architectures
+let (instance, loadStream) = await Kuzco.shared.instance(for: profile)
+for await progress in loadStream {
+    print("Loading: \(progress.stage) - \(progress.detail ?? "")")
+    if progress.stage == .ready { break }
+}
+```
+
+The fallback system will:
+1. First try the detected architecture (qwen3)
+2. If that fails, automatically retry with qwen2
+3. If qwen2 fails, fall back to unknown/ChatML formatting
+4. Provide clear logging about which fallback is being used
+
 ## 🤝 Contributing
 
 We welcome contributions! Here's how you can help:
@@ -398,3 +435,163 @@ This project is licensed under the **Apache License 2.0** - see the [LICENSE](LI
   <strong>Built with ❤️ for the Swift community</strong><br>
   <sub>Made by <a href="https://github.com/jaredcassoutt">Jared Cassoutt</a></sub>
 </div>
+
+## Recent Updates
+
+✨ **Enhanced Model Architecture Support**: Kuzco now supports a wide range of model architectures including:
+- Qwen2 and Qwen3 models
+- CodeLlama variants  
+- DeepSeek models
+- Command-R models
+- Yi models
+- Mixtral models
+- And more with automatic architecture detection
+
+🔧 **Improved Error Handling**: Better error messages for unsupported model architectures with helpful suggestions.
+
+🎯 **Dynamic Model Loading**: Automatic architecture detection from model file names with fallback support.
+
+## Features
+
+- **Easy Model Loading**: Automatic architecture detection and configuration
+- **Comprehensive Architecture Support**: Wide range of model architectures with proper prompt formatting
+- **Dynamic Error Handling**: Helpful error messages and suggestions for troubleshooting
+- **Caching System**: Intelligent model caching for faster subsequent loads
+- **SwiftUI Integration**: Ready for use in SwiftUI applications
+
+## Quick Start
+
+### Loading a Model with Automatic Architecture Detection
+
+```swift
+import Kuzco
+
+// Automatic architecture detection from filename
+let modelProfile = ModelProfile(
+    id: "my-qwen3-model",
+    sourcePath: "/path/to/qwen3-8b-instruct.gguf"
+    // architecture will be auto-detected as .qwen3
+)
+
+let (instance, loadStream) = await Kuzco.shared.instance(for: modelProfile)
+
+// Monitor loading progress
+for await progress in loadStream {
+    print("Loading: \(progress.stage) - \(progress.detail ?? "")")
+    if progress.stage == .ready { break }
+}
+```
+
+### Explicit Architecture Specification
+
+```swift
+// Explicitly specify architecture for better control
+let modelProfile = ModelProfile(
+    id: "my-model",
+    sourcePath: "/path/to/model.gguf",
+    architecture: .qwen3
+)
+```
+
+### Handling Different Model Architectures
+
+```swift
+// The library automatically handles prompt formatting for different architectures
+let dialogue = [
+    Turn(role: .user, text: "Hello, how are you?")
+]
+
+let predictionStream = try await Kuzco.shared.predict(
+    dialogue: dialogue,
+    systemPrompt: "You are a helpful assistant.",
+    with: modelProfile
+)
+
+for try await token in predictionStream {
+    print(token, terminator: "")
+}
+```
+
+### Model Validation
+
+```swift
+// Validate model file before loading
+do {
+    try modelProfile.validateModelFile()
+    print("Model file is valid GGUF format")
+} catch {
+    print("Model validation failed: \(error.localizedDescription)")
+    print("Suggestion: \(modelProfile.getArchitectureSuggestions())")
+}
+```
+
+## Supported Model Architectures
+
+| Architecture | Models | Prompt Format |
+|--------------|--------|---------------|
+| `.qwen2`, `.qwen3` | Qwen series | ChatML format |
+| `.llama3` | LLaMA 3 | LLaMA 3 format |
+| `.codellama` | CodeLlama | LLaMA format |
+| `.mistralInstruct`, `.mixtral` | Mistral models | Mistral format |
+| `.deepseek` | DeepSeek models | DeepSeek format |
+| `.commandR` | Command-R models | Command-R format |
+| `.yi` | Yi models | ChatML format |
+| `.phiGeneric` | Phi models | Phi format |
+| `.gemmaInstruct` | Gemma models | Gemma format |
+| `.openChat` | OpenChat models | ChatML format |
+| `.llamaGeneral` | General LLaMA | LLaMA format |
+| `.unknown` | Auto-fallback | ChatML format |
+
+## Error Handling
+
+If you encounter model loading errors, Kuzco provides helpful error messages:
+
+```swift
+do {
+    let (instance, loadStream) = await Kuzco.shared.instance(for: modelProfile)
+    // ... handle loading
+} catch let error as KuzcoError {
+    switch error {
+    case .unsupportedModelArchitecture(let arch, let suggestion):
+        print("Unsupported architecture '\(arch)': \(suggestion)")
+    case .modelInitializationFailed(let details):
+        print("Model failed to load: \(details)")
+    default:
+        print("Error: \(error.localizedDescription)")
+    }
+}
+```
+
+## Common Issues and Solutions
+
+### "unknown model architecture: 'qwen3'" Error
+
+This error typically occurs when:
+1. The underlying llama.cpp version doesn't support the model architecture
+2. The model file is corrupted or incompatible
+
+**Solutions:**
+- Ensure you're using a GGUF format model
+- Try using the automatic architecture detection by not specifying the architecture explicitly
+- Check that the model file is not corrupted
+- For Qwen3 models specifically, ensure you have a recent enough llama.cpp version
+
+### Model File Not Loading
+
+1. **Check file path**: Ensure the file path is correct and accessible
+2. **Validate format**: Use `modelProfile.validateModelFile()` to check if it's a valid GGUF file
+3. **Check architecture**: Let Kuzco auto-detect the architecture or specify it explicitly
+
+### Performance Optimization
+
+- Use model caching to avoid reloading the same models
+- Adjust instance settings for your hardware capabilities
+- Consider using smaller quantized models for faster inference
+
+## Contributing
+
+We welcome contributions! Please feel free to submit issues and pull requests.
+
+## License
+
+This project is licensed under the Apache 2.0 License.

@@ -53,23 +53,112 @@ public actor Kuzco {
             }
         }
 
-        // Create new instance
-        let newInstance = await LlamaInstance(
-            profile: profile,
+        // Auto-detect architecture if unknown
+        var finalProfile = profile
+        if profile.architecture == .unknown {
+            let detectedArch = ModelArchitecture.detectFromPath(profile.sourcePath)
+            finalProfile = ModelProfile(
+                id: profile.id,
+                sourcePath: profile.sourcePath, 
+                architecture: detectedArch
+            )
+            print("🦙 Kuzco - Auto-detected architecture: \(detectedArch.rawValue) for model: \(profile.sourcePath)")
+        }
+
+        // Create new instance with fallback handling
+        var currentInstance = await LlamaInstance(
+            profile: finalProfile,
             settings: settings,
             predictionConfig: predictionConfig,
             formatter: formatter,
             customStopSequences: customStopSequences
         )
-        activeInstances[profile.id] = newInstance
-        instanceLeaseCount[profile.id, default: 0] = 1
+        activeInstances[finalProfile.id] = currentInstance
+        instanceLeaseCount[finalProfile.id, default: 0] = 1
 
-        let loadStream = await newInstance.startup()
-        return (newInstance, loadStream)
+        let loadStream = await currentInstance.startup()
+        
+        // Check if startup failed due to unsupported architecture and try fallback
+        let fallbackStream = AsyncStream<LoadUpdate> { continuation in
+            Task {
+                var lastUpdate: LoadUpdate?
+                for await update in loadStream {
+                    lastUpdate = update
+                    continuation.yield(update)
+                    
+                    // If loading failed due to unsupported architecture, try fallback
+                    if update.stage == .failed && 
+                       (update.detail?.contains("unsupported model architecture") == true ||
+                        update.detail?.contains("qwen3") == true ||
+                        update.detail?.contains("qwen2") == true) {
+                        
+                        print("🦙 Kuzco - Attempting fallback for unsupported architecture: \(finalProfile.architecture.rawValue)")
+                        
+                        // Try with a fallback architecture
+                        let fallbackArch = finalProfile.architecture.getFallbackArchitecture()
+                        
+                        let fallbackProfile = ModelProfile(
+                            id: finalProfile.id,
+                            sourcePath: finalProfile.sourcePath,
+                            architecture: fallbackArch
+                        )
+                        
+                        continuation.yield(LoadUpdate(stage: .preparing, detail: "Retrying with fallback architecture: \(fallbackArch.rawValue)"))
+                        
+                        // Remove the failed instance
+                        activeInstances.removeValue(forKey: finalProfile.id)
+                        instanceLeaseCount.removeValue(forKey: finalProfile.id)
+                        await currentInstance.performShutdown()
+                        
+                        // Create new instance with fallback
+                        let fallbackInstance = await LlamaInstance(
+                            profile: fallbackProfile,
+                            settings: settings,
+                            predictionConfig: predictionConfig,
+                            formatter: formatter,
+                            customStopSequences: customStopSequences
+                        )
+                        activeInstances[finalProfile.id] = fallbackInstance
+                        instanceLeaseCount[finalProfile.id, default: 0] = 1
+                        currentInstance = fallbackInstance
+                        
+                        // Try loading with fallback
+                        let fallbackLoadStream = await fallbackInstance.startup()
+                        for await fallbackUpdate in fallbackLoadStream {
+                            continuation.yield(fallbackUpdate)
+                            if fallbackUpdate.stage == .ready || fallbackUpdate.stage == .failed {
+                                break
+                            }
+                        }
+                        break
+                    }
+                    
+                    if update.stage == .ready || update.stage == .failed {
+                        break
+                    }
+                }
+                continuation.finish()
+            }
+        }
+        
+        return (currentInstance, fallbackStream)
     }
 
+    /// Predict with a given dialogue and a required system prompt.
+    ///
+    /// - Parameters:
+    ///   - dialogue: The conversation turns to base the prediction on.
+    ///   - systemPrompt: A required system prompt to guide the model's behavior.
+    ///   - modelProfile: The model profile to use.
+    ///   - instanceSettings: Settings for the model instance.
+    ///   - predictionConfig: Configuration for prediction behavior.
+    ///   - formatter: Optional formatter for interaction formatting.
+    ///   - customStopSequences: Optional custom stop sequences.
+    ///
+    /// - Returns: An asynchronous throwing stream of prediction output strings.
     public func predict(
         dialogue: [Turn],
+        systemPrompt: String,
         with modelProfile: ModelProfile,
         instanceSettings: InstanceSettings = .standard,
         predictionConfig: PredictionConfig = .balanced,
@@ -96,11 +185,24 @@ public actor Kuzco {
             }
         }
 
-        return await llamaInstance.generate(dialogue: dialogue, overridePredictionConfig: predictionConfig)
+        return await llamaInstance.generate(dialogue: dialogue, overrideSystemPrompt: systemPrompt, overridePredictionConfig: predictionConfig)
     }
 
+    /// Predict with completion info with a given dialogue and a required system prompt.
+    ///
+    /// - Parameters:
+    ///   - dialogue: The conversation turns to base the prediction on.
+    ///   - systemPrompt: A required system prompt to guide the model's behavior.
+    ///   - modelProfile: The model profile to use.
+    ///   - instanceSettings: Settings for the model instance.
+    ///   - predictionConfig: Configuration for prediction behavior.
+    ///   - formatter: Optional formatter for interaction formatting.
+    ///   - customStopSequences: Optional custom stop sequences.
+    ///
+    /// - Returns: An asynchronous throwing stream of StreamResponse with completion details.
     public func predictWithCompletionInfo(
         dialogue: [Turn],
+        systemPrompt: String,
         with modelProfile: ModelProfile,
         instanceSettings: InstanceSettings = .standard,
         predictionConfig: PredictionConfig = .balanced,
@@ -127,7 +229,7 @@ public actor Kuzco {
             }
         }
 
-        return await llamaInstance.generateWithCompletionInfo(dialogue: dialogue, overridePredictionConfig: predictionConfig)
+        return await llamaInstance.generateWithCompletionInfo(dialogue: dialogue, overrideSystemPrompt: systemPrompt, overridePredictionConfig: predictionConfig)
     }
 
     public func releaseInstance(for profileID: String, forceShutdown: Bool = false) async {

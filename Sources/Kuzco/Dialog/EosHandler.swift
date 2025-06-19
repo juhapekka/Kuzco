@@ -20,12 +20,24 @@ public struct EosHandler {
     public func getDefaultStopSequences() -> [String] {
         var sequences: [String] = []
         switch architecture {
-        case .llamaGeneral: sequences.append(contentsOf: ["</s>", "[INST]"])
-        case .llama3: sequences.append(contentsOf: ["<|eot_id|>", "<|start_header_id|>user<|end_header_id|>"])
-        case .mistralInstruct: sequences.append(contentsOf: ["</s>", "[INST]"])
-        case .phiGeneric: sequences.append(contentsOf: ["<|end|>", "<|user|>"])
-        case .gemmaInstruct: sequences.append(contentsOf: ["<end_of_turn>", "<eos>", "<start_of_turn>user"])
-        case .openChat: sequences.append(contentsOf: ["<|im_end|>", "<|im_start|>user"])
+        case .llamaGeneral, .codellama: 
+            sequences.append(contentsOf: ["</s>", "[INST]"])
+        case .llama3: 
+            sequences.append(contentsOf: ["<|eot_id|>", "<|start_header_id|>user<|end_header_id|>"])
+        case .mistralInstruct, .mixtral: 
+            sequences.append(contentsOf: ["</s>", "[INST]"])
+        case .phiGeneric: 
+            sequences.append(contentsOf: ["<|end|>", "<|user|>"])
+        case .gemmaInstruct: 
+            sequences.append(contentsOf: ["<end_of_turn>", "<eos>", "<start_of_turn>user"])
+        case .openChat, .qwen2, .qwen3, .yi: 
+            sequences.append(contentsOf: ["<|im_end|>", "<|im_start|>user"])
+        case .deepseek: 
+            sequences.append(contentsOf: ["User:", "Assistant:"])
+        case .commandR: 
+            sequences.append(contentsOf: ["<|END_OF_TURN_TOKEN|>", "<|USER_TOKEN|>"])
+        case .unknown:
+            sequences.append(contentsOf: ["<|im_end|>", "<|im_start|>user"])
         }
         return sequences
     }

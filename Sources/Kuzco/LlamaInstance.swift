@@ -100,18 +100,75 @@ public class LlamaInstance {
         publishProgress(LoadUpdate(stage: .preparing))
 
         do {
-            publishProgress(LoadUpdate(stage: .readingModel, detail: "Accessing \(profile.sourcePath)"))
-            guard FileManager.default.fileExists(atPath: profile.sourcePath) else {
-                throw KuzcoError.modelFileNotAccessible(path: profile.sourcePath)
+            // Validate model file before attempting to load
+            publishProgress(LoadUpdate(stage: .readingModel, detail: "Validating model file at \(profile.sourcePath)"))
+            
+            // Use the bridge's validation function
+            try LlamaKitBridge.validateModelFile(path: profile.sourcePath)
+            publishProgress(LoadUpdate(stage: .readingModel, detail: "Model file validation passed"))
+
+            // Attempt to load the model with enhanced error handling
+            publishProgress(LoadUpdate(stage: .readingModel, detail: "Loading model data..."))
+            
+            do {
+                self.clModel = try LlamaKitBridge.loadModel(from: profile.sourcePath, settings: self.settings)
+                publishProgress(LoadUpdate(stage: .readingModel, detail: "Model data loaded successfully."))
+            } catch let error as KuzcoError {
+                // Handle specific model loading errors
+                switch error {
+                case .unsupportedModelArchitecture(let architecture, let suggestion):
+                    publishProgress(LoadUpdate(
+                        stage: .failed,
+                        detail: "Unsupported model architecture '\(architecture)': \(suggestion)",
+                        hasError: true
+                    ))
+                    await performShutdownInternal()
+                    return
+                case .modelInitializationFailed(let details):
+                    publishProgress(LoadUpdate(
+                        stage: .failed,
+                        detail: "Model loading failed: \(details)",
+                        hasError: true
+                    ))
+                    await performShutdownInternal()
+                    return
+                default:
+                    throw error
+                }
             }
 
-            self.clModel = try LlamaKitBridge.loadModel(from: profile.sourcePath, settings: self.settings)
-            publishProgress(LoadUpdate(stage: .readingModel, detail: "Model data loaded."))
+            publishProgress(LoadUpdate(stage: .creatingContext, detail: "Initializing inference context..."))
+            guard let model = self.clModel else { 
+                throw KuzcoError.modelInitializationFailed(details: "Model pointer nil after successful load - this is unexpected") 
+            }
+            
+            // Create context with error handling
+            do {
+                self.clContext = try LlamaKitBridge.createContext(for: model, settings: self.settings)
+            } catch let error as KuzcoError {
+                switch error {
+                case .contextCreationFailed(let details):
+                    // Try with reduced settings as fallback
+                    publishProgress(LoadUpdate(stage: .creatingContext, detail: "Primary context creation failed, trying fallback settings..."))
+                    
+                    var fallbackSettings = self.settings
+                    fallbackSettings.contextLength = min(self.settings.contextLength, 2048)
+                    fallbackSettings.processingBatchSize = min(self.settings.processingBatchSize, 256)
+                    fallbackSettings.offloadedGpuLayers = 0 // CPU only
+                    
+                    do {
+                        self.clContext = try LlamaKitBridge.createContext(for: model, settings: fallbackSettings)
+                        self.settings = fallbackSettings // Update to working settings
+                        publishProgress(LoadUpdate(stage: .creatingContext, detail: "Context created with fallback settings (CPU-only, reduced context)"))
+                    } catch {
+                        throw KuzcoError.contextCreationFailed(details: "Both primary and fallback context creation failed: \(details)")
+                    }
+                default:
+                    throw error
+                }
+            }
 
-            publishProgress(LoadUpdate(stage: .creatingContext))
-            guard let model = self.clModel else { throw KuzcoError.modelInitializationFailed(details: "Model pointer nil after load") }
-            self.clContext = try LlamaKitBridge.createContext(for: model, settings: self.settings)
-
+            // Validate context
             if let ctx = self.clContext {
                 let modelMaxCtx = LlamaKitBridge.getModelMaxContextLength(context: ctx)
                 if self.settings.contextLength > modelMaxCtx {
@@ -119,22 +176,37 @@ public class LlamaInstance {
                     self.settings.contextLength = modelMaxCtx
                 }
             }
-            publishProgress(LoadUpdate(stage: .creatingContext, detail: "Context initialized."))
+            publishProgress(LoadUpdate(stage: .creatingContext, detail: "Context validated."))
 
-            self.clBatch = try LlamaKitBridge.createBatch(maxTokens: self.settings.processingBatchSize)
-            publishProgress(LoadUpdate(stage: .creatingContext, detail: "Token batch ready."))
+            // Create batch with error handling
+            do {
+                self.clBatch = try LlamaKitBridge.createBatch(maxTokens: self.settings.processingBatchSize)
+                publishProgress(LoadUpdate(stage: .creatingContext, detail: "Token batch created."))
+            } catch {
+                throw KuzcoError.batchCreationFailed
+            }
 
-            publishProgress(LoadUpdate(stage: .prewarming))
-            try await prewarmEngine()
-            publishProgress(LoadUpdate(stage: .prewarming, detail: "Engine pre-warmed."))
+            // Pre-warm with extra safety
+            publishProgress(LoadUpdate(stage: .prewarming, detail: "Pre-warming inference engine..."))
+            do {
+                try await prewarmEngine()
+                publishProgress(LoadUpdate(stage: .prewarming, detail: "Engine pre-warmed successfully."))
+            } catch let error as KuzcoError {
+                // Pre-warming failure is often non-fatal, continue with warning
+                print("🦙 Kuzco Warning: Pre-warming failed: \(error.localizedDescription). Continuing anyway. 🦙")
+                publishProgress(LoadUpdate(stage: .prewarming, detail: "Pre-warming failed but continuing (non-fatal)."))
+            }
 
-            publishProgress(LoadUpdate(stage: .ready))
+            publishProgress(LoadUpdate(stage: .ready, detail: "Model ready for inference"))
+            
         } catch let error as KuzcoError {
+            print("🦙 Kuzco Startup Error: \(error.localizedDescription) 🦙")
             await performShutdownInternal()
             publishProgress(LoadUpdate(stage: .failed, detail: error.localizedDescription, hasError: true))
         } catch {
+            print("🦙 Kuzco Unexpected Startup Error: \(error.localizedDescription) 🦙")
             await performShutdownInternal()
-            publishProgress(LoadUpdate(stage: .failed, detail: error.localizedDescription, hasError: true))
+            publishProgress(LoadUpdate(stage: .failed, detail: "Unexpected error: \(error.localizedDescription)", hasError: true))
         }
     }
 
