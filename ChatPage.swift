@@ -18,16 +18,23 @@ private func continueGeneration(for assistantMsg: ChatMessage) async {
     }
     let userPrompt = session.messages[idx - 1]
     
-    // Build conversation history including the partial assistant response
+    // Build conversation history for continuation
+    // This creates the dialogue structure that will result in the correct prompt formatting
     let historyUpToUser = Array(session.messages.prefix(upTo: idx))
     
-    // Create a modified history that includes the partial response and asks for continuation
-    var continuationHistory = historyUpToUser
-    continuationHistory.append(ChatMessage(content: userPrompt.content, role: .user, session: session))
-    continuationHistory.append(ChatMessage(content: assistantMsg.content, role: .assistant, session: session))
+    // Convert chat messages to Turn objects for the LLM interface
+    var dialogueTurns: [Turn] = []
+    for message in historyUpToUser {
+        let role: DialogueRole = message.role == .user ? .user : .assistant
+        dialogueTurns.append(Turn(role: role, text: message.content))
+    }
     
-    // Add a simple continuation request
-    let continuePrompt = "Continue"
+    // Add the current user prompt
+    dialogueTurns.append(Turn(role: .user, text: userPrompt.content))
+    
+    // Add the partial assistant response as the beginning of the assistant's turn
+    // This allows the model to continue from where it left off
+    dialogueTurns.append(Turn(role: .assistant, text: assistantMsg.content))
     
     isTyping = true
     defer {
@@ -41,28 +48,30 @@ private func continueGeneration(for assistantMsg: ChatMessage) async {
     var didTriggerStartHaptic = false
 
     do {
-        for try await (content, isComplete, completionReason) in llm.stream(
-            chatHistoryMessages: continuationHistory,
-            userInput: continuePrompt,
-            lengthPreference: nil
+        // Use the LLM's generate method with the properly structured dialogue
+        for try await response in llm.generateWithCompletionInfo(
+            dialogue: dialogueTurns,
+            overrideSystemPrompt: nil, // Use default system prompt
+            overridePredictionConfig: nil,
+            overrideContextLength: nil
         ) {
-            if !didTriggerStartHaptic && !content.isEmpty {
+            if !didTriggerStartHaptic && !response.content.isEmpty {
                 #if os(iOS)
                 triggerHaptic()
                 #endif
                 didTriggerStartHaptic = true
             }
 
-            if !content.isEmpty {
-                buffer += content
+            if !response.content.isEmpty {
+                buffer += response.content
                 assistantMsg.content = buffer
                 assistantMsg.completionStatus = .unknown // Reset status during generation
                 try? context.save()
             }
             
             // Handle completion
-            if isComplete {
-                if let reason = completionReason {
+            if response.isComplete {
+                if let reason = response.completionReason {
                     switch reason {
                     case .natural:
                         assistantMsg.completionStatus = .completed
