@@ -269,6 +269,40 @@ public class LlamaInstance {
         print("Kuzco LlamaInstance (\(profile.id)) global instance settings updated. Context-related changes might require model reload.")
     }
 
+
+public func generateTokenIDs(
+    dialogue: [Turn],
+    overrideSystemPrompt: String? = nil,
+    overridePredictionConfig: PredictionConfig? = nil,
+    overrideContextLength: UInt32? = nil
+) -> AsyncThrowingStream<Int32, Error> {
+    return AsyncThrowingStream { continuation in
+        Task { @LlamaInstanceActor [] in
+            do {
+                for try await response in self.generateWithCompletionInfo(
+                    dialogue: dialogue,
+                    overrideSystemPrompt: overrideSystemPrompt,
+                    overridePredictionConfig: overridePredictionConfig,
+                    overrideContextLength: overrideContextLength
+                ) {
+                    // Poimi tokenId, vaikka content olisi tyhjä
+                    if let tid = response.tokenId {
+                        continuation.yield(tid)
+                    }
+                    if response.isComplete {
+                        continuation.finish()
+                        return
+                    }
+                }
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+    }
+}
+
+
+
     public func generate(
         dialogue: [Turn],
         overrideSystemPrompt: String? = nil,
@@ -313,11 +347,18 @@ public class LlamaInstance {
         let effectivePredictionConfig = overridePredictionConfig ?? self.predictionCfg
         let currentCallContextLength = overrideContextLength ?? self.settings.contextLength
 
-        let promptString = interactionFormatter.constructPrompt(
-            for: dialogue,
-            modelArchitecture: profile.architecture,
-            systemPrompt: effectiveSystemPrompt
-        )
+        let promptString: String
+        if (overrideSystemPrompt == "speak"),   // käytä tätä lippuna audio-tilaan
+        let last = dialogue.last, last.role == .user {
+            let voice = "tara" // vaihda haluamasi ääni tähän tai välitä parametrina
+            promptString = "<|audio|>\(voice): \(last.text)<|eot_id|>"
+        } else {
+            promptString = interactionFormatter.constructPrompt(
+                for: dialogue,
+                modelArchitecture: profile.architecture,
+                systemPrompt: effectiveSystemPrompt
+            )
+        }
 
         return AsyncThrowingStream { continuation in
             Task { @LlamaInstanceActor [] in
@@ -410,50 +451,59 @@ public class LlamaInstance {
                             return
                         }
 
-                        let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
-                        var pieceToYield = piece
-                        var stopForThisToken = false
-                        var foundStopSequence: String? = nil
+                    let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
+                    var pieceToYield = piece
+                    var stopForThisToken = false
+                    var foundStopSequence: String? = nil
 
-                        if !allStopSequences.isEmpty {
-                            let checkBuffer = generatedStringAccumulator + piece
-                            for stopSeq in allStopSequences {
-                                if checkBuffer.hasSuffix(stopSeq) {
-                                    if let stopRangeInPiece = piece.range(of: stopSeq, options: [.anchored, .backwards], range: piece.startIndex..<piece.endIndex, locale: nil) {
-                                        pieceToYield = String(piece[..<stopRangeInPiece.lowerBound])
-                                    } else if let stopRangeInAccumulator = (generatedStringAccumulator + piece).range(of: stopSeq, options: [.anchored, .backwards]) {
-                                        if stopRangeInAccumulator.lowerBound < generatedStringAccumulator.endIndex {
-                                            let pieceContributionStartIndex = generatedStringAccumulator.endIndex > stopRangeInAccumulator.lowerBound ?
-                                                generatedStringAccumulator.endIndex : stopRangeInAccumulator.lowerBound
-                                            let distanceIntoPiece = (generatedStringAccumulator + piece).distance(from: pieceContributionStartIndex, to: stopRangeInAccumulator.lowerBound)
-                                            if distanceIntoPiece < 0 {
-                                                let charsInPieceToCut = piece.distance(from: piece.startIndex, to: piece.index(piece.startIndex, offsetBy: -distanceIntoPiece))
-                                                if charsInPieceToCut < piece.count {
-                                                    pieceToYield = String(piece.prefix(upTo: piece.index(piece.startIndex, offsetBy: charsInPieceToCut)))
-                                                } else {
-                                                    pieceToYield = ""
-                                                }
-                                            }
+                    if !allStopSequences.isEmpty {
+                        let checkBuffer = generatedStringAccumulator + piece
+                        for stopSeq in allStopSequences {
+                            if checkBuffer.hasSuffix(stopSeq) {
+                                if let stopRangeInPiece = piece.range(of: stopSeq, options: [.anchored, .backwards], range: piece.startIndex..<piece.endIndex, locale: nil) {
+                                    pieceToYield = String(piece[..<stopRangeInPiece.lowerBound])
+                                } else if let stopRangeInAccumulator = (generatedStringAccumulator + piece).range(of: stopSeq, options: [.anchored, .backwards]) {
+                                    if stopRangeInAccumulator.lowerBound < generatedStringAccumulator.endIndex {
+                                        let pieceContributionStartIndex = max(generatedStringAccumulator.endIndex, stopRangeInAccumulator.lowerBound)
+                                        let distanceIntoPiece = (generatedStringAccumulator + piece).distance(from: pieceContributionStartIndex, to: stopRangeInAccumulator.lowerBound)
+                                        if distanceIntoPiece < 0 {
+                                            let charsInPieceToCut = piece.distance(from: piece.startIndex, to: piece.index(piece.startIndex, offsetBy: -distanceIntoPiece))
+                                            pieceToYield = charsInPieceToCut < piece.count ? String(piece.prefix(charsInPieceToCut)) : ""
                                         }
                                     }
-                                    stopForThisToken = true
-                                    foundStopSequence = stopSeq
-                                    print("🦙 Kuzco - Stopped by antiprompt '\(stopSeq)' (piece: \"\(piece)\", yielded: \"\(pieceToYield)\") 🦙")
-                                    break
                                 }
+                                stopForThisToken = true
+                                foundStopSequence = stopSeq
+                                print("🦙 Kuzco - Stopped by antiprompt '\(stopSeq)' (piece: \"\(piece)\", yielded: \"\(pieceToYield)\") 🦙")
+                                break
                             }
                         }
+                    }
 
-                        if !pieceToYield.isEmpty { 
-                            continuation.yield(StreamResponse(content: pieceToYield, isComplete: false))
-                        }
-                        generatedStringAccumulator += piece
+                    // ⬇️ UUSI: aina emitataan tokenId (vaikka content olisi tyhjä)
+                    // Huom. jos StreamResponse.tokenId on optional, poista Int32()-cast tai tee tokenId: Int32?
+                    let resp = StreamResponse(
+                        content: pieceToYield,
+                        isComplete: false,
+                        completionReason: nil,
+                        tokenId: Int32(sampledToken)
+                    )
+                    continuation.yield(resp)
 
-                        if stopForThisToken { 
-                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .stopSequenceFound(foundStopSequence!)))
-                            continuation.finish()
-                            return
-                        }
+                    // Päivitä akkumulaattori alkuperäisellä piece:llä
+                    generatedStringAccumulator += piece
+
+                    if stopForThisToken {
+                        // Lähetä päätösviesti (content tyhjä, tokenId ei tarpeen)
+                        continuation.yield(StreamResponse(
+                            content: "",
+                            isComplete: true,
+                            completionReason: .natural ,   // käytä teidän enumista sopivaa arvoa
+                            tokenId: nil                   // jos tokenId on optional; jos ei, jätä pois parametri
+                        ))
+                        continuation.finish()
+                        return
+                    }
 
                         self.currentContextTokens.append(sampledToken)
                         guard self.clBatch != nil else { throw KuzcoError.batchCreationFailed }
