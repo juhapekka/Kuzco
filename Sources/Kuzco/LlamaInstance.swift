@@ -229,6 +229,31 @@ public class LlamaInstance {
         } catch {
             throw KuzcoError.warmUpRoutineFailed(details: "Exception during prewarm: \(error.localizedDescription)")
         }
+
+    }
+
+    // Build whitelist for speak-mode: allow only <custom_token_N> and (optionally) <|eot_id|>
+    private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, eot: Int32?) {
+        let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
+        var allowed = Set<Int32>()
+        allowed.reserveCapacity(8192)
+        var eotTok: Int32? = nil
+
+        for tid in 0..<nVocab {
+            let s = LlamaKitBridge.detokenize(token: Int32(tid), model: model)
+            if s == "<|eot_id|>" {
+                eotTok = Int32(tid)
+                allowed.insert(Int32(tid))
+                continue
+            }
+            if s.hasPrefix("<custom_token_") && s.hasSuffix(">") {
+                let inner = s.dropFirst("<custom_token_".count).dropLast()
+                if !inner.isEmpty, Int(inner) != nil {
+                    allowed.insert(Int32(tid))
+                }
+            }
+        }
+        return (allowed, eotTok)
     }
 
     public func performShutdown() async {
@@ -352,12 +377,28 @@ public func generateTokenIDs(
         let last = dialogue.last, last.role == .user {
             let voice = "tara" // vaihda haluamasi ääni tähän tai välitä parametrina
             promptString = "<|audio|>\(voice): \(last.text)<|eot_id|>"
+
+            
         } else {
             promptString = interactionFormatter.constructPrompt(
                 for: dialogue,
                 modelArchitecture: profile.architecture,
                 systemPrompt: effectiveSystemPrompt
             )
+        }
+        // ➋ SPEAK-tilassa: ei chat-templaten stoppeja, ei extra BOS/EOS
+        var effectiveStopSequences: [String] = []
+        var addBOSToken = true
+        var addEOSToken = false
+        if overrideSystemPrompt == "speak" {
+            effectiveStopSequences = []     // ei antiprompteja
+            addBOSToken = false             // älä lisää BOS
+            addEOSToken = false             // älä pakota EOS:ia
+            // poistetaan myös paikallinen kontekstilista (KV nollataan myöhemmin kun context on käytettävissä)
+            self.currentContextTokens.removeAll(keepingCapacity: false)
+        } else {
+            // tavallisessa tilassa käytetään normaalit stop-sequt
+            effectiveStopSequences = self.eosHandler.getAllEffectiveStopSequences()
         }
 
         return AsyncThrowingStream { continuation in
@@ -366,11 +407,26 @@ public func generateTokenIDs(
                     continuation.finish(throwing: KuzcoError.engineNotReady)
                     return
                 }
+                // SPEAK-tilassa varmistetaan puhdas KV-cache
+                if overrideSystemPrompt == "speak" {
+                    LlamaKitBridge.clearKeyValueCache(context: context)
+                    self.currentContextTokens.removeAll(keepingCapacity: false)
+                }
+
+                // Build whitelist once for this speak-session
+                var speakWhitelist: Set<Int32> = []
+                var speakEOT: Int32? = nil
+                if overrideSystemPrompt == "speak" {
+                    let wl = self.buildCustomWhitelist(model: model)
+                    speakWhitelist = wl.allowed
+                    speakEOT = wl.eot
+                    print("🔒 Speak whitelist size = \(speakWhitelist.count)")
+                }
 
                 let actualMaxContextForThisCall = min(currentCallContextLength, self.settings.contextLength)
 
                 do {
-                    let promptTokens = try LlamaKitBridge.tokenize(text: promptString, model: model, addBos: true, parseSpecial: true)
+                    let promptTokens = try LlamaKitBridge.tokenize(text: promptString, model: model, addBos: addBOSToken, parseSpecial: true)
 
                     var commonPrefixLength = 0
                     while commonPrefixLength < self.currentContextTokens.count &&
@@ -429,8 +485,11 @@ public func generateTokenIDs(
 
                     var generatedStringAccumulator = ""
                     var tokensGeneratedThisTurn = 0
-                    let allStopSequences = self.eosHandler.getAllEffectiveStopSequences()
+                    // käytä aiemmin määriteltyjä stoppareita; SPEAK-tilassa tämä on tyhjä lista
+                    let allStopSequences = effectiveStopSequences
                     let maxTokensForThisGeneration = effectivePredictionConfig.maxOutputTokens_effective(actualMaxContextForThisCall - UInt32(kvCachePosition))
+
+                    var dbgCount = 0
 
                     while tokensGeneratedThisTurn < maxTokensForThisGeneration {
                         if self.interruptFlag { 
@@ -443,7 +502,31 @@ public func generateTokenIDs(
                             throw KuzcoError.predictionFailed(details: "Failed to retrieve logits.")
                         }
 
-                        let sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
+                        let sampledToken: CLlamaToken
+                        if overrideSystemPrompt == "speak" {
+                            // Masked greedy over whitelist
+                            let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
+                            let buf = UnsafeBufferPointer(start: logits, count: nVocab)
+                            var bestTok: Int32 = 0
+                            var bestVal: Float = -Float.infinity
+                            for i in 0..<nVocab {
+                                let tid = Int32(i)
+                                if speakWhitelist.contains(tid) {
+                                    let v = buf[i]
+                                    if v > bestVal { bestVal = v; bestTok = tid }
+                                }
+                            }
+                            sampledToken = bestTok
+                        } else {
+                            sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
+                        }
+
+                        // Explicit EOT guard for speak-mode
+                        if overrideSystemPrompt == "speak", let eot = speakEOT, sampledToken == eot {
+                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural, tokenId: Int32(sampledToken)))
+                            continuation.finish()
+                            return
+                        }
 
                         if LlamaKitBridge.isEndOfGenerationToken(model: model, token: sampledToken) {
                             continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
@@ -455,6 +538,11 @@ public func generateTokenIDs(
                     var pieceToYield = piece
                     var stopForThisToken = false
                     var foundStopSequence: String? = nil
+                    if overrideSystemPrompt == "speak" && dbgCount < 120 {
+                        let isCustom = piece.hasPrefix("<custom_token_")
+                        print("🎯 tokenId=\(sampledToken) piece='\(piece)' custom=\(isCustom)")
+                        dbgCount += 1
+                    }
 
                     if !allStopSequences.isEmpty {
                         let checkBuffer = generatedStringAccumulator + piece
@@ -539,6 +627,95 @@ public func generateTokenIDs(
             }
         }
     }
+
+
+
+    // Speak-mode sampler: temperature + top-k/top-p + repetition penalty
+private func sampleTokenSpeak(
+    model: CLlamaModel,
+    logitsPtr: UnsafePointer<Float>,
+    vocabSize: Int,
+    cfg: PredictionConfig,
+    recentTokens: [CLlamaToken],
+    repeatWindow: Int = 128
+) -> CLlamaToken {
+    // Kopioi logits Swift-taulukkoon
+    var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: vocabSize))
+
+    // Repetition penalty
+    if cfg.repetitionPenalty > 1.0, !recentTokens.isEmpty {
+        let start = max(0, recentTokens.count - repeatWindow)
+        for t in recentTokens[start...] {
+            let idx = Int(t)
+            if idx >= 0 && idx < vocabSize {
+                let v = logits[idx]
+                logits[idx] = v >= 0 ? (v / Float(cfg.repetitionPenalty)) : (v * Float(cfg.repetitionPenalty))
+            }
+        }
+    }
+
+    // Temperature
+    let temperature = max(0.05, cfg.temperature)
+    if temperature != 1.0 {
+        let invT = 1.0 / Float(temperature)
+        for i in 0..<vocabSize { logits[i] *= invT }
+    }
+
+    // top-k
+    var idxs = Array(0..<vocabSize)
+    let k = max(1, cfg.topKCandidates)
+    idxs.sort { logits[$0] > logits[$1] }
+    var kept = Array(idxs.prefix(min(Int(k), vocabSize)))
+
+    // softmax kept-joukkoon
+    let maxLogit = kept.map { logits[$0] }.max() ?? 0
+    var probs: [Float] = []
+    probs.reserveCapacity(kept.count)
+    var sumExp: Float = 0
+    for id in kept {
+        let e = expf(logits[id] - maxLogit)
+        probs.append(e)
+        sumExp += e
+    }
+    if sumExp <= 0 { return CLlamaToken(0) }
+    for i in 0..<probs.count { probs[i] /= sumExp }
+
+    // top-p
+    let topP = min(max(0.05, cfg.topProbabilityMass), 1.0)
+    if topP < 0.999 {
+        let order = (0..<kept.count).sorted { probs[$0] > probs[$1] }
+        var cum: Float = 0
+        var cut = kept.count
+        for (rank, pos) in order.enumerated() {
+            cum += probs[pos]
+            if cum >= topP { cut = rank + 1; break }
+        }
+        let trimmed = Array(order.prefix(cut))
+        var newKept: [Int] = []
+        var newProbs: [Float] = []
+        var newSum: Float = 0
+        for pos in trimmed {
+            newKept.append(kept[pos])
+            let p = probs[pos]
+            newProbs.append(p)
+            newSum += p
+        }
+        if newSum > 0 {
+            for i in 0..<newProbs.count { newProbs[i] /= newSum }
+            kept = newKept
+            probs = newProbs
+        }
+    }
+
+    // multinomial sample
+    let r = Float.random(in: 0..<1)
+    var acc: Float = 0
+    for (i, p) in probs.enumerated() {
+        acc += p
+        if r <= acc { return CLlamaToken(kept[i]) }
+    }
+    return CLlamaToken(kept.last ?? 0)
+}
 }
 
 private extension PredictionConfig {

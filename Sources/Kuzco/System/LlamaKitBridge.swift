@@ -22,6 +22,10 @@ enum LlamaKitBridge {
         llama_backend_free()
     }
 
+    public static func getVocabSize(model: CLlamaModel) -> Int {
+        return Int(llama_n_vocab(model))
+    }
+
     /// Validates a model file before attempting to load it
     static func validateModelFile(path: String) throws {
         // Check if file exists
