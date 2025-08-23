@@ -233,28 +233,81 @@ public class LlamaInstance {
 
     }
 
-    // Build whitelist for speak-mode: allow only <custom_token_N> and (optionally) <|eot_id|>
-    private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, eot: Int32?) {
+// Build whitelist for speak-mode: allow only <custom_token_N> and end aliases.
+// Prefer <|eot_id|> if present; otherwise take the first alias we find.
+private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, eot: Int32?) {
+    let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
+    var allowed = Set<Int32>()
+    allowed.reserveCapacity(8192)
+    var eotTok: Int32? = nil
+
+    let endAliases: Set<String> = ["<|eot_id|>", "<|eos|>", "<|endoftext|>", "<|im_end|>"]
+
+    for tid in 0..<nVocab {
+        let s = LlamaKitBridge.detokenize(token: Int32(tid), model: model)
+
+        if endAliases.contains(s) {
+            // Prefer canonical <|eot_id|>, otherwise take the first alias we encounter.
+            if eotTok == nil || s == "<|eot_id|>" {
+                eotTok = Int32(tid)
+            }
+            allowed.insert(Int32(tid))
+            continue
+        }
+
+        if s.hasPrefix("<custom_token_") && s.hasSuffix(">") {
+            let inner = s.dropFirst("<custom_token_".count).dropLast()
+            if !inner.isEmpty, Int(inner) != nil {
+                allowed.insert(Int32(tid))
+            }
+        }
+    }
+    return (allowed, eotTok)
+}
+
+    // Build a *boost* set (no hard mask): audio codes + helpful specials
+    private func buildSpeakBoostSet(model: CLlamaModel) -> (boost: Set<Int32>, eot: Int32?) {
         let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
-        var allowed = Set<Int32>()
-        allowed.reserveCapacity(8192)
+        var boost = Set<Int32>(); boost.reserveCapacity(32768)
         var eotTok: Int32? = nil
+
+        let endAliases: Set<String> = ["<|eot_id|>", "<|eos|>", "<|endoftext|>", "<|im_end|>"]
+        let expressive: Set<String> = ["<laugh>", "<sigh>", "<groan>", "<chuckle>", "<yawn>", "<gasp>", "<cough>", "<sniffle>"]
 
         for tid in 0..<nVocab {
             let s = LlamaKitBridge.detokenize(token: Int32(tid), model: model)
-            if s == "<|eot_id|>" {
+            if endAliases.contains(s) {
                 eotTok = Int32(tid)
-                allowed.insert(Int32(tid))
+                boost.insert(Int32(tid))
                 continue
             }
             if s.hasPrefix("<custom_token_") && s.hasSuffix(">") {
-                let inner = s.dropFirst("<custom_token_".count).dropLast()
-                if !inner.isEmpty, Int(inner) != nil {
-                    allowed.insert(Int32(tid))
-                }
+                boost.insert(Int32(tid));
+                continue
+            }
+            if expressive.contains(s) {
+                boost.insert(Int32(tid));
+                continue
+            }
+            // Optional: lightly include any other bracketed tags
+            if s.hasPrefix("<") && s.hasSuffix(">") {
+                boost.insert(Int32(tid));
+                continue
             }
         }
-        return (allowed, eotTok)
+        return (boost, eotTok)
+    }
+
+    // Map `<custom_token_N>` piece to SNAC id given how many valid codes have been accepted so far.
+    // Mirrors Python: id = N - 10 - ((accepted % 7) * 4096); accept iff 0 < id < 4096.
+    private func snacId(fromCustomPiece piece: String, acceptedSoFar: Int, base: Int = 10, vocab: Int = 4096) -> Int? {
+        guard piece.hasPrefix("<custom_token_"), piece.hasSuffix(">") else { return nil }
+        let prefix = "<custom_token_"
+        let start = piece.index(piece.startIndex, offsetBy: prefix.count)
+        let end = piece.index(before: piece.endIndex)
+        guard start <= end, let bigN = Int(piece[start...end]) else { return nil }
+        let id = bigN - base - ((acceptedSoFar % 7) * vocab)
+        return (id > 0 && id < vocab) ? id : nil
     }
 
         // Masked greedy for speak-mode: allow only custom tokens (+EOT), optionally block EOT,
@@ -292,54 +345,43 @@ public class LlamaInstance {
         return CLlamaToken(best)
     }
 
-    // Speak-mode sampler: whitelist + (temp, top-k, top-p, repetition penalty)
-    private func maskedSampleAudioToken(
-        model: CLlamaModel,
+    // Speak-mode sampler with *soft boost* (no hard masking): repetition penalty + temp/top-k/top-p
+    private func boostedSampleForSpeak(
         logitsPtr: UnsafePointer<Float>,
         vocabSize: Int,
         cfg: PredictionConfig,
-        whitelist: Set<Int32>,
-        eotToken: Int32?,
-        blockEOT: Bool,
         recentTokens: [CLlamaToken],
-        repeatWindow: Int = 128,
-        eotBias: Float
+        boostSet: Set<Int32>,
+        boostAmount: Float = 2.0,
+        repeatWindow: Int = 128
     ) -> CLlamaToken {
-        // 1) Copy logits
         var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: vocabSize))
-        let negInf: Float = -1e30
 
-        // 2) whitelist + EOT-block, with optional EOT bias
-        for i in 0..<vocabSize {
-            let tid = Int32(i)
-            var allowed = whitelist.contains(tid)
-            if let eot = eotToken, tid == eot {
-                allowed = !blockEOT
-                if allowed { logits[i] += eotBias }
-            }
-            if !allowed { logits[i] = negInf }
-        }
-
-        // 3) repetition penalty (only last window)
+        // repetition penalty
         if cfg.repetitionPenalty > 1.0, !recentTokens.isEmpty {
             let start = max(0, recentTokens.count - repeatWindow)
             for t in recentTokens[start...] {
-                let idx = Int(t)
-                if idx >= 0 && idx < vocabSize {
-                    let v = logits[idx]
-                    logits[idx] = v >= 0 ? (v / Float(cfg.repetitionPenalty)) : (v * Float(cfg.repetitionPenalty))
+                let i = Int(t)
+                if i >= 0 && i < vocabSize {
+                    let v = logits[i]
+                    logits[i] = v >= 0 ? (v / Float(cfg.repetitionPenalty)) : (v * Float(cfg.repetitionPenalty))
                 }
             }
         }
 
-        // 4) temperature
+        // gentle positive bias for preferred tokens (audio codes + specials)
+        for i in 0..<vocabSize {
+            if boostSet.contains(Int32(i)) { logits[i] += boostAmount }
+        }
+
+        // temperature
         let temperature = max(0.05, cfg.temperature)
         if temperature != 1.0 {
             let invT = 1.0 / Float(temperature)
             for i in 0..<vocabSize { logits[i] *= invT }
         }
 
-        // 5) top-k
+        // top-k
         let k = max(1, cfg.topKCandidates)
         var idxs = Array(0..<vocabSize)
         idxs.sort { logits[$0] > logits[$1] }
@@ -347,53 +389,46 @@ public class LlamaInstance {
 
         // softmax over kept
         let maxLogit = kept.map { logits[$0] }.max() ?? 0
-        var probs: [Float] = []
-        probs.reserveCapacity(kept.count)
-        var sumExp: Float = 0
-        for id in kept {
-            let e = expf(logits[id] - maxLogit)
-            probs.append(e)
-            sumExp += e
-        }
+        var probs = kept.map { expf(logits[$0] - maxLogit) }
+        var sumExp: Float = probs.reduce(0, +)
         if sumExp <= 0 { return CLlamaToken(kept.first ?? 0) }
         for i in 0..<probs.count { probs[i] /= sumExp }
 
-        // 6) top-p
-        var order = (0..<kept.count).sorted { probs[$0] > probs[$1] }
-        var cum: Float = 0
+        // top-p
         let topP = min(max(0.05, cfg.topProbabilityMass), 1.0)
-        var cut = kept.count
         if topP < 0.999 {
+            let order = (0..<kept.count).sorted { probs[$0] > probs[$1] }
+            var cum: Float = 0
+            var cut = kept.count
             for (rank, pos) in order.enumerated() {
                 cum += probs[pos]
                 if cum >= topP { cut = rank + 1; break }
             }
-            order = Array(order.prefix(cut))
+            let trimmed = Array(order.prefix(cut))
+            var newKept: [Int] = []
+            var newProbs: [Float] = []
+            var newSum: Float = 0
+            for pos in trimmed {
+                newKept.append(kept[pos])
+                let p = probs[pos]
+                newProbs.append(p)
+                newSum += p
+            }
+            if newSum > 0 {
+                kept = newKept
+                for i in 0..<newProbs.count { newProbs[i] /= newSum }
+                probs = newProbs
+            }
         }
 
-        // renormalize + multinomial sample
-        var newKept: [Int] = []
-        var newProbs: [Float] = []
-        var newSum: Float = 0
-        for pos in order {
-            newKept.append(kept[pos])
-            let p = probs[pos]
-            newProbs.append(p)
-            newSum += p
-        }
-        if newSum > 0 {
-            for i in 0..<newProbs.count { newProbs[i] /= newSum }
-        } else {
-            return CLlamaToken(newKept.first ?? kept.first ?? 0)
-        }
-
+        // multinomial draw
         let r = Float.random(in: 0..<1)
         var acc: Float = 0
-        for (i, p) in newProbs.enumerated() {
+        for (i, p) in probs.enumerated() {
             acc += p
-            if r <= acc { return CLlamaToken(newKept[i]) }
+            if r <= acc { return CLlamaToken(kept[i]) }
         }
-        return CLlamaToken(newKept.last ?? kept.last ?? 0)
+        return CLlamaToken(kept.last ?? 0)
     }
 
     public func performShutdown() async {
@@ -553,18 +588,34 @@ public func generateTokenIDs(
                     self.currentContextTokens.removeAll(keepingCapacity: false)
                 }
 
-                // Build whitelist once for this speak-session
-                var speakWhitelist: Set<Int32> = []
+                // Build a soft *boost* set once for this speak-session (audio codes + specials + EOT aliases)
+                // This mirrors the Python path: we do NOT hard-mask the vocabulary.
+                // We allow the model to pick <|eot_id|> naturally.
+                var speakBoost: Set<Int32> = []
                 var speakEOT: Int32? = nil
+                var speakWhitelist: Set<Int32> = []
                 if overrideSystemPrompt == "speak" {
-                    let wl = self.buildCustomWhitelist(model: model)
-                    speakWhitelist = wl.allowed
-                    speakEOT = wl.eot
+                    let b = self.buildSpeakBoostSet(model: model)
+                    speakBoost = b.boost
+                    speakEOT = b.eot
+                    print("🎛️ Speak boost set size = \(speakBoost.count)")
+                }
+                // Also build a hard whitelist for early frames (<custom_token_*> + EOT)
+                if overrideSystemPrompt == "speak" {
+                    let w = self.buildCustomWhitelist(model: model)
+                    speakWhitelist = w.allowed
+                    if speakEOT == nil { speakEOT = w.eot }
                     print("🔒 Speak whitelist size = \(speakWhitelist.count)")
                 }
-                // Speak-mode safety rails: require some audio tokens before letting EOT end the stream
+                // Speak-mode local sampling config: greedy, no pruning, no rep-penalty (mirrors Python path)
+                var speakCfg = effectivePredictionConfig
+                // Greedy, no pruning, no rep-penalty → mirrors Python path
+                speakCfg.repetitionPenalty = 1.0
+                speakCfg.temperature = 0.0
+                speakCfg.topProbabilityMass = 1.0
+                speakCfg.topKCandidates = 1
+                // Speak-mode safety rails (soft): count audio tokens, cap total if needed
                 var audioTokensEmitted = 0
-                let minAudioBeforeEOT = 28 // nosta 56:een jos haluat pidemmän pakotetun jatkon ennen EOT:ta
                 let maxAudioTokensSpeak = 448 // ~64 multiframe steps (7 tokens each)
 
                 let actualMaxContextForThisCall = min(currentCallContextLength, self.settings.contextLength)
@@ -635,8 +686,12 @@ public func generateTokenIDs(
 
                     var dbgCount = 0
                     var recentAudioTokens: [CLlamaToken] = []
+                    // Counters for speak-mode gating
+                    var audioCustomSeen = 0            // count of <custom_token_*> seen (for safety cap)
+                    var validAudioAccepted = 0         // count of valid mapped SNAC ids (Python-style)
 
                     while tokensGeneratedThisTurn < maxTokensForThisGeneration {
+                        var sampledToken: CLlamaToken = CLlamaToken(0)
                         if self.interruptFlag { 
                             continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .userStopped))
                             continuation.finish()
@@ -647,63 +702,53 @@ public func generateTokenIDs(
                             throw KuzcoError.predictionFailed(details: "Failed to retrieve logits.")
                         }
 
-                        let sampledToken: CLlamaToken
                         if overrideSystemPrompt == "speak" {
                             let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
-                            let blockEOT = (audioTokensEmitted < minAudioBeforeEOT)
-                            var eotBias: Float = 0
-                            if overrideSystemPrompt == "speak" && !blockEOT {
-                                let over = max(0, audioTokensEmitted - minAudioBeforeEOT)
-                                // Ramp up to make EOT increasingly likely as audio grows
-                                eotBias = min(6.0, 1.5 + 0.02 * Float(over))
-                            }
-                            sampledToken = self.maskedSampleAudioToken(
-                                model: model,
+                            sampledToken = self.maskedGreedyAudioToken(
                                 logitsPtr: logits,
                                 vocabSize: nVocab,
-                                cfg: effectivePredictionConfig,
                                 whitelist: speakWhitelist,
                                 eotToken: speakEOT,
-                                blockEOT: blockEOT,
-                                recentTokens: recentAudioTokens,
-                                repeatWindow: 128,
-                                eotBias: eotBias
+                                blockEOT: (validAudioAccepted < 28),
+                                boost: 0.0
                             )
                         } else {
                             sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
                         }
 
                         // Explicit EOT guard for speak-mode
-                        if overrideSystemPrompt == "speak", let eot = speakEOT, sampledToken == eot {
+                        if overrideSystemPrompt == "speak", let eot = speakEOT, sampledToken == eot, validAudioAccepted >= 28 {
                             continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural, tokenId: Int32(sampledToken)))
                             continuation.finish()
                             return
                         }
 
-                        // Count audio tokens (non-EOT) and maintain repetition-penalty window
-                        if overrideSystemPrompt == "speak" {
-                            if let eot = speakEOT {
-                                if sampledToken != eot && speakWhitelist.contains(sampledToken) {
-                                    audioTokensEmitted += 1
-                                    recentAudioTokens.append(sampledToken)
-                                    if recentAudioTokens.count > 512 {
-                                        recentAudioTokens.removeFirst(recentAudioTokens.count - 512)
-                                    }
-                                }
-                            } else if speakWhitelist.contains(sampledToken) {
-                                audioTokensEmitted += 1
-                                recentAudioTokens.append(sampledToken)
-                                if recentAudioTokens.count > 512 {
-                                    recentAudioTokens.removeFirst(recentAudioTokens.count - 512)
+                    let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
+
+                    if overrideSystemPrompt == "speak" {
+                        let isCustom = piece.hasPrefix("<custom_token_")
+                        if isCustom {
+                            audioCustomSeen += 1
+                            // Count only **valid** mapped codes (Python-style)
+                            if self.snacId(fromCustomPiece: piece, acceptedSoFar: validAudioAccepted) != nil {
+                                validAudioAccepted += 1
+                                if validAudioAccepted == 28 {
+                                    print("🔓 Speak: unlocked after first 28 valid SNAC codes (custom seen=\(audioCustomSeen))")
                                 }
                             }
+                            // Track for (soft) repetition penalty window
+                            recentAudioTokens.append(sampledToken)
+                            if recentAudioTokens.count > 512 {
+                                recentAudioTokens.removeFirst(recentAudioTokens.count - 512)
+                            }
                         }
-                        if overrideSystemPrompt == "speak" && audioTokensEmitted >= maxAudioTokensSpeak {
-                            // Gracefully end if the model refuses to emit EOT
+                        // Safety cap to avoid pathological loops even if valid codes don't accumulate
+                        if audioCustomSeen >= maxAudioTokensSpeak {
                             continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .maxTokensReached))
                             continuation.finish()
                             return
                         }
+                    }
 
                         if LlamaKitBridge.isEndOfGenerationToken(model: model, token: sampledToken) {
                             continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
@@ -711,7 +756,7 @@ public func generateTokenIDs(
                             return
                         }
 
-                    let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
+//                    let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
                     var pieceToYield = piece
                     var stopForThisToken = false
                     var foundStopSequence: String? = nil
