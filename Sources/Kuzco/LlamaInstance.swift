@@ -307,7 +307,7 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
         let end = piece.index(before: piece.endIndex)
         guard start <= end, let bigN = Int(piece[start...end]) else { return nil }
         let id = bigN - base - ((acceptedSoFar % 7) * vocab)
-        return (id > 0 && id < vocab) ? id : nil
+        return (id >= 0 && id < vocab) ? id : nil
     }
 
         // Masked greedy for speak-mode: allow only custom tokens (+EOT), optionally block EOT,
@@ -704,14 +704,52 @@ public func generateTokenIDs(
 
                         if overrideSystemPrompt == "speak" {
                             let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
-                            sampledToken = self.maskedGreedyAudioToken(
+
+                            // 1) Python-henkinen pehmeä sampling
+                            var speakCfg = effectivePredictionConfig
+                            speakCfg.repetitionPenalty = 1.0
+                            speakCfg.temperature = 0.7         // top-p/top-k kaveriksi
+                            speakCfg.topProbabilityMass = 0.95 // top-p
+                            speakCfg.topKCandidates = 100      // top-k
+
+                            var proposed = self.boostedSampleForSpeak(
                                 logitsPtr: logits,
                                 vocabSize: nVocab,
-                                whitelist: speakWhitelist,
-                                eotToken: speakEOT,
-                                blockEOT: (validAudioAccepted < 28),
-                                boost: 0.0
+                                cfg: speakCfg,
+                                recentTokens: recentAudioTokens,
+                                boostSet: speakBoost,
+                                boostAmount: 2.0,
+                                repeatWindow: 128
                             )
+
+                            // 2) ENNEN kuin 28 validia SNAC-koodia on kasassa:
+                            //    - blokkaa EOT
+                            //    - jos ehdokas EI ole <custom_token_*>, resamplaa kovalla whitelistillä customiksi
+                            if validAudioAccepted < 28 {
+                                if let eot = speakEOT, proposed == eot {
+                                    proposed = self.maskedGreedyAudioToken(
+                                        logitsPtr: logits,
+                                        vocabSize: nVocab,
+                                        whitelist: speakWhitelist,   // customit + EOT
+                                        eotToken: eot,
+                                        blockEOT: true,              // EOT pois päältä kunnes unlock
+                                        boost: 0.0
+                                    )
+                                }
+                                let piece0 = LlamaKitBridge.detokenize(token: proposed, model: model)
+                                if !piece0.hasPrefix("<custom_token_") {
+                                    proposed = self.maskedGreedyAudioToken(
+                                        logitsPtr: logits,
+                                        vocabSize: nVocab,
+                                        whitelist: speakWhitelist,   // vain customit (+EOT)
+                                        eotToken: speakEOT,
+                                        blockEOT: true,              // edelleen blokissa
+                                        boost: 0.0
+                                    )
+                                }
+                            }
+
+                            sampledToken = proposed
                         } else {
                             sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
                         }
@@ -730,8 +768,11 @@ public func generateTokenIDs(
                         if isCustom {
                             audioCustomSeen += 1
                             // Count only **valid** mapped codes (Python-style)
-                            if self.snacId(fromCustomPiece: piece, acceptedSoFar: validAudioAccepted) != nil {
+                            if let mapped = self.snacId(fromCustomPiece: piece, acceptedSoFar: validAudioAccepted) {
                                 validAudioAccepted += 1
+                                if validAudioAccepted <= 35 {
+                                    print("🔎 SNAC ok[\(validAudioAccepted-1)] = \(mapped)")
+                                }
                                 if validAudioAccepted == 28 {
                                     print("🔓 Speak: unlocked after first 28 valid SNAC codes (custom seen=\(audioCustomSeen))")
                                 }
