@@ -548,18 +548,32 @@ public func generateTokenIDs(
         let currentCallContextLength = overrideContextLength ?? self.settings.contextLength
 
         let promptString: String
-        if (overrideSystemPrompt == "speak"),   // käytä tätä lippuna audio-tilaan
+        if (overrideSystemPrompt == "speak"),
         let last = dialogue.last, last.role == .user {
-            let voice = "tara" // vaihda haluamasi ääni tähän tai välitä parametrina
+            let voice = "tara"
             promptString = "<|audio|>\(voice): \(last.text)<|eot_id|>"
-
-            
         } else {
             promptString = interactionFormatter.constructPrompt(
                 for: dialogue,
                 modelArchitecture: profile.architecture,
                 systemPrompt: effectiveSystemPrompt
             )
+        }
+        // Dynamic budget for speak-mode: estimate number of 28-token windows from text length
+        var speakText: String = ""
+        var speakBudgetWindows: Int = Int.max
+        if overrideSystemPrompt == "speak", let last = dialogue.last, last.role == .user {
+            speakText = last.text
+            // Heuristic tuned for SNAC @24kHz: ~0.085 s per window (28 ids)
+            // Words-based: ~1.5 windows per word + small lead-in/out margin
+            // Chars-based: ~1 window per ~9 chars + margin
+            let words = speakText.split { $0.isWhitespace || $0.isNewline }.count
+            let chars = speakText.count
+            let byWords = Int(ceil(Double(words) * 1.5)) + 4
+            let byChars = Int(ceil(Double(chars) / 9.0)) + 3
+            // Use the larger estimate so we don't clip, but clamp to a sane upper bound
+            speakBudgetWindows = max(4, min(24, max(byWords, byChars)))
+            print("⏱️ Speak budget windows = \(speakBudgetWindows) (words=\(words), chars=\(chars), byWords=\(byWords), byChars=\(byChars))")
         }
         // ➋ SPEAK-tilassa: ei chat-templaten stoppeja, ei extra BOS/EOS
         var effectiveStopSequences: [String] = []
@@ -607,6 +621,8 @@ public func generateTokenIDs(
                     if speakEOT == nil { speakEOT = w.eot }
                     print("🔒 Speak whitelist size = \(speakWhitelist.count)")
                 }
+                // Capture speak window budget for use inside the loop
+                let speakBudgetWindowsLocal = speakBudgetWindows
                 // Speak-mode local sampling config: greedy, no pruning, no rep-penalty (mirrors Python path)
                 var speakCfg = effectivePredictionConfig
                 // Greedy, no pruning, no rep-penalty → mirrors Python path
@@ -781,6 +797,24 @@ public func generateTokenIDs(
                             recentAudioTokens.append(sampledToken)
                             if recentAudioTokens.count > 512 {
                                 recentAudioTokens.removeFirst(recentAudioTokens.count - 512)
+                            }
+                        }
+                        // 🚦 Stop conditions to avoid repeats once we have enough audio
+                        // 1) If we have unlocked and now see a non-custom token, finish naturally (audio segment ended)
+                        if validAudioAccepted >= 28 {
+                            if !isCustom {
+                                print("✅ Speak: first non-audio token after unlock → finishing")
+                                continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
+                                continuation.finish()
+                                return
+                            }
+                            // 2) If we have produced our dynamic window budget, finish
+                            let acceptedWindows = validAudioAccepted / 28
+                            if acceptedWindows >= speakBudgetWindowsLocal {
+                                print("⏱️ Speak: window budget reached (\(acceptedWindows)/\(speakBudgetWindowsLocal)) → finishing")
+                                continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
+                                continuation.finish()
+                                return
                             }
                         }
                         // Safety cap to avoid pathological loops even if valid codes don't accumulate
