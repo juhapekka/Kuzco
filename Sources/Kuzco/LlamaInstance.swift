@@ -705,6 +705,9 @@ public func generateTokenIDs(
                     // Counters for speak-mode gating
                     var audioCustomSeen = 0            // count of <custom_token_*> seen (for safety cap)
                     var validAudioAccepted = 0         // count of valid mapped SNAC ids (Python-style)
+                    // Boundary-finishing control
+                    var pendingFinishAtBoundary = false
+                    var forceTailFillToBoundary = false
 
                     while tokensGeneratedThisTurn < maxTokensForThisGeneration {
                         var sampledToken: CLlamaToken = CLlamaToken(0)
@@ -721,47 +724,59 @@ public func generateTokenIDs(
                         if overrideSystemPrompt == "speak" {
                             let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
 
-                            // 1) Python-henkinen pehmeä sampling
-                            var speakCfg = effectivePredictionConfig
-                            speakCfg.repetitionPenalty = 1.0
-                            speakCfg.temperature = 0.7         // top-p/top-k kaveriksi
-                            speakCfg.topProbabilityMass = 0.95 // top-p
-                            speakCfg.topKCandidates = 100      // top-k
+                            var proposed: CLlamaToken
 
-                            var proposed = self.boostedSampleForSpeak(
-                                logitsPtr: logits,
-                                vocabSize: nVocab,
-                                cfg: speakCfg,
-                                recentTokens: recentAudioTokens,
-                                boostSet: speakBoost,
-                                boostAmount: 2.0,
-                                repeatWindow: 128
-                            )
+                            if forceTailFillToBoundary {
+                                // Täytetään seuraavaan 7:n rajaan custom-koodeilla; EOT blokissa
+                                proposed = self.maskedGreedyAudioToken(
+                                    logitsPtr: logits,
+                                    vocabSize: nVocab,
+                                    whitelist: speakWhitelist,
+                                    eotToken: speakEOT,
+                                    blockEOT: true,
+                                    boost: 0.0
+                                )
+                            } else {
+                                // 1) Python-tyylinen pehmeä sampling
+                                var speakCfg = effectivePredictionConfig
+                                speakCfg.repetitionPenalty = 1.0
+                                speakCfg.temperature = 0.7
+                                speakCfg.topProbabilityMass = 0.95
+                                speakCfg.topKCandidates = 100
 
-                            // 2) ENNEN kuin 28 validia SNAC-koodia on kasassa:
-                            //    - blokkaa EOT
-                            //    - jos ehdokas EI ole <custom_token_*>, resamplaa kovalla whitelistillä customiksi
-                            if validAudioAccepted < 28 {
-                                if let eot = speakEOT, proposed == eot {
-                                    proposed = self.maskedGreedyAudioToken(
-                                        logitsPtr: logits,
-                                        vocabSize: nVocab,
-                                        whitelist: speakWhitelist,   // customit + EOT
-                                        eotToken: eot,
-                                        blockEOT: true,              // EOT pois päältä kunnes unlock
-                                        boost: 0.0
-                                    )
-                                }
-                                let piece0 = LlamaKitBridge.detokenize(token: proposed, model: model)
-                                if !piece0.hasPrefix("<custom_token_") {
-                                    proposed = self.maskedGreedyAudioToken(
-                                        logitsPtr: logits,
-                                        vocabSize: nVocab,
-                                        whitelist: speakWhitelist,   // vain customit (+EOT)
-                                        eotToken: speakEOT,
-                                        blockEOT: true,              // edelleen blokissa
-                                        boost: 0.0
-                                    )
+                                proposed = self.boostedSampleForSpeak(
+                                    logitsPtr: logits,
+                                    vocabSize: nVocab,
+                                    cfg: speakCfg,
+                                    recentTokens: recentAudioTokens,
+                                    boostSet: speakBoost,
+                                    boostAmount: 2.0,
+                                    repeatWindow: 128
+                                )
+
+                                // 2) Ennen unlockia (28 validia) blokkaa EOT ja resamplaa customiksi
+                                if validAudioAccepted < 28 {
+                                    if let eot = speakEOT, proposed == eot {
+                                        proposed = self.maskedGreedyAudioToken(
+                                            logitsPtr: logits,
+                                            vocabSize: nVocab,
+                                            whitelist: speakWhitelist,
+                                            eotToken: eot,
+                                            blockEOT: true,
+                                            boost: 0.0
+                                        )
+                                    }
+                                    let piece0 = LlamaKitBridge.detokenize(token: proposed, model: model)
+                                    if !piece0.hasPrefix("<custom_token_") {
+                                        proposed = self.maskedGreedyAudioToken(
+                                            logitsPtr: logits,
+                                            vocabSize: nVocab,
+                                            whitelist: speakWhitelist,
+                                            eotToken: speakEOT,
+                                            blockEOT: true,
+                                            boost: 0.0
+                                        )
+                                    }
                                 }
                             }
 
@@ -770,12 +785,7 @@ public func generateTokenIDs(
                             sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
                         }
 
-                        // Explicit EOT guard for speak-mode
-                        if overrideSystemPrompt == "speak", let eot = speakEOT, sampledToken == eot, validAudioAccepted >= 28 {
-                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural, tokenId: Int32(sampledToken)))
-                            continuation.finish()
-                            return
-                        }
+
 
                     let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
 
@@ -786,6 +796,12 @@ public func generateTokenIDs(
                             // Count only **valid** mapped codes (Python-style)
                             if let mapped = self.snacId(fromCustomPiece: piece, acceptedSoFar: validAudioAccepted) {
                                 validAudioAccepted += 1
+                                if pendingFinishAtBoundary && validAudioAccepted >= 28 && (validAudioAccepted % 7 == 0) {
+                                    print("✅ Speak: finishing at boundary")
+                                    continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
+                                    continuation.finish()
+                                    return
+                                }
                                 if validAudioAccepted <= 35 {
                                     print("🔎 SNAC ok[\(validAudioAccepted-1)] = \(mapped)")
                                 }
@@ -802,19 +818,16 @@ public func generateTokenIDs(
                         // 🚦 Stop conditions to avoid repeats once we have enough audio
                         // 1) If we have unlocked and now see a non-custom token, finish naturally (audio segment ended)
                         if validAudioAccepted >= 28 {
-                            if !isCustom {
-                                print("✅ Speak: first non-audio token after unlock → finishing")
-                                continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
-                                continuation.finish()
-                                return
+                            if !isCustom && !pendingFinishAtBoundary {
+                                pendingFinishAtBoundary = true
+                                forceTailFillToBoundary = true
+                                print("✅ Speak: non-audio after unlock → finishing at next boundary")
                             }
-                            // 2) If we have produced our dynamic window budget, finish
                             let acceptedWindows = validAudioAccepted / 28
-                            if acceptedWindows >= speakBudgetWindowsLocal {
-                                print("⏱️ Speak: window budget reached (\(acceptedWindows)/\(speakBudgetWindowsLocal)) → finishing")
-                                continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
-                                continuation.finish()
-                                return
+                            if acceptedWindows >= speakBudgetWindowsLocal && !pendingFinishAtBoundary {
+                                pendingFinishAtBoundary = true
+                                forceTailFillToBoundary = true
+                                print("⏱️ Speak: window budget reached (\(acceptedWindows)/\(speakBudgetWindowsLocal)) → finishing at next boundary")
                             }
                         }
                         // Safety cap to avoid pathological loops even if valid codes don't accumulate
@@ -826,10 +839,14 @@ public func generateTokenIDs(
                     }
 
                         if LlamaKitBridge.isEndOfGenerationToken(model: model, token: sampledToken) {
+                        if overrideSystemPrompt == "speak" && (pendingFinishAtBoundary || validAudioAccepted < 28) {
+                            // Ohita EOG: jatketaan rajalle (priming tai tail-fill)
+                        } else {
                             continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
                             continuation.finish()
                             return
                         }
+                    }
 
 //                    let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
                     var pieceToYield = piece
