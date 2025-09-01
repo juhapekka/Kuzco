@@ -299,18 +299,47 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
     }
 
     // Map `<custom_token_N>` piece to SNAC id given how many valid codes have been accepted so far.
-    // Mirrors Python: id = N - 10 - ((accepted % 7) * 4096); accept iff 0 < id < 4096.
+    // Mirrors Python: id = N - base - ((accepted % 7) * vocab); accept iff 0 <= id < vocab.
+    // This parser is tolerant to trailing characters (e.g. whitespace, hidden markers) after N.
     private func snacId(fromCustomPiece piece: String, acceptedSoFar: Int, base: Int = 10, vocab: Int = 4096) -> Int? {
-        guard piece.hasPrefix("<custom_token_"), piece.hasSuffix(">") else { return nil }
         let prefix = "<custom_token_"
-        let start = piece.index(piece.startIndex, offsetBy: prefix.count)
-        let end = piece.index(before: piece.endIndex)
-        guard start <= end, let bigN = Int(piece[start...end]) else { return nil }
-        let id = bigN - base - ((acceptedSoFar % 7) * vocab)
+        guard let p0 = piece.range(of: prefix)?.upperBound else { return nil }
+        // Scan forward for a run of digits; stop at first non-digit (which may be '>' or something else).
+        var p = p0
+        var hasDigit = false
+        var value: Int = 0
+        while p < piece.endIndex {
+            let ch = piece[p]
+            if ch >= "0" && ch <= "9" {
+                hasDigit = true
+                // value = value * 10 + (ch - "0")
+                if let d = ch.wholeNumberValue {
+                    value = value * 10 + d
+                }
+                p = piece.index(after: p)
+                continue
+            }
+            break
+        }
+        guard hasDigit else { return nil }
+        let bigN = value
+        let step = acceptedSoFar % 7
+        let id = bigN - base - (step * vocab)
         return (id >= 0 && id < vocab) ? id : nil
     }
 
-        // Masked greedy for speak-mode: allow only custom tokens (+EOT), optionally block EOT,
+    // Resolve a token id for an explicit <custom_token_N> piece (no BOS, parse specials)
+    private func tokenIdForCustomBigN(_ bigN: Int) -> CLlamaToken? {
+        guard let model = self.clModel else { return nil }
+        let piece = "<custom_token_\(bigN)>"
+        if let toks = try? LlamaKitBridge.tokenize(text: piece, model: model, addBos: false, parseSpecial: true),
+           let t = toks.first {
+            return CLlamaToken(t)
+        }
+        return nil
+    }
+
+    // Masked greedy for speak-mode: allow only custom tokens (+EOT), optionally block EOT,
     // and add a positive boost to audio-token logits to avoid early EOT.
     private func maskedGreedyAudioToken(
         logitsPtr: UnsafePointer<Float>,
@@ -321,13 +350,14 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
         boost: Float
     ) -> CLlamaToken {
         var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: vocabSize))
+        let originalLogits = logits
         let negInf: Float = -1e30
 
         // Apply whitelist mask, optional EOT block, and boost for audio tokens
         for i in 0..<vocabSize {
             let tid = Int32(i)
             if let eot = eotToken, tid == eot {
-                logits[i] = blockEOT ? negInf : logits[i]
+                logits[i] = blockEOT ? negInf : (logits[i] + boost)
             } else if whitelist.contains(tid) {
                 logits[i] += boost
             } else {
@@ -335,13 +365,115 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
             }
         }
 
-        // Argmax
-        var best = 0
+        // Argmax over masked logits
+        var best = -1
         var bestVal = -Float.infinity
         for i in 0..<vocabSize {
             let v = logits[i]
             if v > bestVal { bestVal = v; best = i }
         }
+
+        // Robust fallback if everything was masked out
+        if best < 0 || !bestVal.isFinite || bestVal <= negInf/2 {
+            if let eot = eotToken, !blockEOT {
+                print("⚠️ maskedGreedyAudioToken: mask collapsed, yielding EOT")
+                return CLlamaToken(eot)
+            }
+            // Fall back to unmasked argmax so we never return tid=0 by accident
+            var b2 = 0
+            var v2 = -Float.infinity
+            for i in 0..<vocabSize {
+                let vv = originalLogits[i]
+                if vv > v2 { v2 = vv; b2 = i }
+            }
+            print("⚠️ maskedGreedyAudioToken: hard fallback to unmasked argmax tid=\(b2)")
+            return CLlamaToken(b2)
+        }
+
+        return CLlamaToken(best)
+    }
+
+    // Select a *valid* custom token for the current SNAC step (acceptedSoFar % 7),
+    // blocking EOT and any custom token that would NOT map to a legal [0, vocab) id.
+    private func maskedGreedyValidAudioForStep(
+        logitsPtr: UnsafePointer<Float>,
+        vocabSize: Int,
+        acceptedSoFar: Int,
+        whitelist: Set<Int32>,
+        eotToken: Int32?,
+        base: Int = 10,
+        vocab: Int = 4096
+    ) -> CLlamaToken {
+        var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: vocabSize))
+        let originalLogits = logits
+        let negInf: Float = -1e30
+
+        // Pre-compute the legal custom-token interval for this step:
+        // bigN in [base + step*vocab, base + step*vocab + vocab - 1]
+        let step = acceptedSoFar % 7
+        let minBigN = base + step * vocab
+        let maxBigN = minBigN + vocab - 1
+
+        @inline(__always)
+        func customBigN(_ tid: Int32) -> Int? {
+            let s = LlamaKitBridge.detokenize(token: tid, model: self.clModel!)
+            if s.hasPrefix("<custom_token_") && s.hasSuffix(">") {
+                let prefix = "<custom_token_"
+                let start = s.index(s.startIndex, offsetBy: prefix.count)
+                let end = s.index(before: s.endIndex)
+                return Int(s[start...end])
+            }
+            return nil
+        }
+
+        // Mask everything except *valid* custom tokens for this step (EOT is *always* blocked here)
+        for i in 0..<vocabSize {
+            let tid = Int32(i)
+            if let eot = eotToken, tid == eot {
+                logits[i] = negInf
+                continue
+            }
+            if !whitelist.contains(tid) {
+                logits[i] = negInf
+                continue
+            }
+            if let bigN = customBigN(tid) {
+                if bigN < minBigN || bigN > maxBigN {
+                    logits[i] = negInf
+                }
+            } else {
+                logits[i] = negInf
+            }
+        }
+
+        // Argmax over masked logits
+        var best = -1
+        var bestVal = -Float.infinity
+        for i in 0..<vocabSize {
+            let v = logits[i]
+            if v > bestVal {
+                bestVal = v
+                best = i
+            }
+        }
+
+        // Fallbacks if mask collapsed (avoid returning 0 / '!' when everything was -inf)
+        if best < 0 || !bestVal.isFinite || bestVal <= negInf/2 {
+            if let tok = tokenIdForCustomBigN(minBigN) {
+                print("⚠️ maskedGreedyValidAudioForStep: mask collapsed, forcing <custom_token_\(minBigN)>")
+                return tok
+            }
+            // Last resort: choose argmax over original (unmasked) logits
+            var b2 = 0
+            var v2 = -Float.infinity
+            for i in 0..<vocabSize {
+                let vv = originalLogits[i]
+                if vv > v2 { v2 = vv; b2 = i }
+            }
+            print("⚠️ maskedGreedyValidAudioForStep: hard fallback to unmasked argmax tid=\(b2)")
+            return CLlamaToken(b2)
+        }
+
         return CLlamaToken(best)
     }
 
@@ -708,6 +840,9 @@ public func generateTokenIDs(
                     // Boundary-finishing control
                     var pendingFinishAtBoundary = false
                     var forceTailFillToBoundary = false
+                    // Emit a synthetic <|eot_id|> marker to the client, and/or finish after we've yielded the boundary token
+                    var emitEOTMarkerNext = false
+                    var finishAfterYield = false
 
                     while tokensGeneratedThisTurn < maxTokensForThisGeneration {
                         var sampledToken: CLlamaToken = CLlamaToken(0)
@@ -727,17 +862,16 @@ public func generateTokenIDs(
                             var proposed: CLlamaToken
 
                             if forceTailFillToBoundary {
-                                // Täytetään seuraavaan 7:n rajaan custom-koodeilla; EOT blokissa
-                                proposed = self.maskedGreedyAudioToken(
+                                // Fill strictly with valid custom codes up to the next 7-boundary (EOT blocked)
+                                proposed = self.maskedGreedyValidAudioForStep(
                                     logitsPtr: logits,
                                     vocabSize: nVocab,
+                                    acceptedSoFar: validAudioAccepted,
                                     whitelist: speakWhitelist,
-                                    eotToken: speakEOT,
-                                    blockEOT: true,
-                                    boost: 0.0
+                                    eotToken: speakEOT
                                 )
                             } else {
-                                // 1) Deterministinen speak-sampling (greedy-tyylinen)
+                                // Deterministic base sampler (no boost)
                                 var speakCfg = effectivePredictionConfig
                                 speakCfg.repetitionPenalty = 1.0
                                 speakCfg.temperature = 0.0
@@ -750,33 +884,19 @@ public func generateTokenIDs(
                                     cfg: speakCfg,
                                     recentTokens: recentAudioTokens,
                                     boostSet: speakBoost,
-                                    boostAmount: 0.0,   // ⬅️ ei positiivista boostiä audio-koodeille
+                                    boostAmount: 0.0,
                                     repeatWindow: 128
                                 )
 
-                                // 2) Ennen unlockia (28 validia) blokkaa EOT ja resamplaa customiksi
+                                // Before unlock, force a *valid* custom token for the current SNAC step.
                                 if validAudioAccepted < 28 {
-                                    if let eot = speakEOT, proposed == eot {
-                                        proposed = self.maskedGreedyAudioToken(
-                                            logitsPtr: logits,
-                                            vocabSize: nVocab,
-                                            whitelist: speakWhitelist,
-                                            eotToken: eot,
-                                            blockEOT: true,
-                                            boost: 0.0
-                                        )
-                                    }
-                                    let piece0 = LlamaKitBridge.detokenize(token: proposed, model: model)
-                                    if !piece0.hasPrefix("<custom_token_") {
-                                        proposed = self.maskedGreedyAudioToken(
-                                            logitsPtr: logits,
-                                            vocabSize: nVocab,
-                                            whitelist: speakWhitelist,
-                                            eotToken: speakEOT,
-                                            blockEOT: true,
-                                            boost: 0.0
-                                        )
-                                    }
+                                    proposed = self.maskedGreedyValidAudioForStep(
+                                        logitsPtr: logits,
+                                        vocabSize: nVocab,
+                                        acceptedSoFar: validAudioAccepted,
+                                        whitelist: speakWhitelist,
+                                        eotToken: speakEOT
+                                    )
                                 }
                             }
 
@@ -797,16 +917,19 @@ public func generateTokenIDs(
                             if let mapped = self.snacId(fromCustomPiece: piece, acceptedSoFar: validAudioAccepted) {
                                 validAudioAccepted += 1
                                 if pendingFinishAtBoundary && validAudioAccepted >= 28 && (validAudioAccepted % 7 == 0) {
-                                    print("✅ Speak: finishing at boundary")
-                                    continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
-                                    continuation.finish()
-                                    return
+                                    // Defer finishing until after we have yielded the token that completed the boundary.
+                                    finishAfterYield = true
                                 }
                                 if validAudioAccepted <= 35 {
                                     print("🔎 SNAC ok[\(validAudioAccepted-1)] = \(mapped)")
                                 }
                                 if validAudioAccepted == 28 {
                                     print("🔓 Speak: unlocked after first 28 valid SNAC codes (custom seen=\(audioCustomSeen))")
+                                }
+                            }
+                            else {
+                                if piece.hasPrefix("<custom_token_") {
+                                    print("⚠️ snacId parse failed for piece '\(piece)' at accepted=\(validAudioAccepted)")
                                 }
                             }
                             // Track for (soft) repetition penalty window
@@ -821,12 +944,14 @@ public func generateTokenIDs(
                             if !isCustom && !pendingFinishAtBoundary {
                                 pendingFinishAtBoundary = true
                                 forceTailFillToBoundary = true
+                                emitEOTMarkerNext = true     // ⬅️ make the stop visible to Orpheus
                                 print("✅ Speak: non-audio after unlock → finishing at next boundary")
                             }
                             let acceptedWindows = validAudioAccepted / 28
                             if acceptedWindows >= speakBudgetWindowsLocal && !pendingFinishAtBoundary {
                                 pendingFinishAtBoundary = true
                                 forceTailFillToBoundary = true
+                                emitEOTMarkerNext = true     // ⬅️ also announce stop when we hit window budget
                                 print("⏱️ Speak: window budget reached (\(acceptedWindows)/\(speakBudgetWindowsLocal)) → finishing at next boundary")
                             }
                         }
@@ -843,9 +968,10 @@ public func generateTokenIDs(
                             if validAudioAccepted < 28 {
                                 // Priming-vaiheessa ohitetaan EOG kokonaan
                             } else if !pendingFinishAtBoundary {
-                                // EOG unlockin jälkeen → täytä seuraavaan 7:n rajaan ja lopeta siellä
+                                // EOG after unlock → fill to next 7-boundary then finish; also emit a synthetic EOT marker for clients.
                                 pendingFinishAtBoundary = true
                                 forceTailFillToBoundary = true
+                                emitEOTMarkerNext = true
                                 print("✅ Speak: EOG after unlock → finishing at next boundary")
                             }
                             // Älä lopeta tässä, jatka silmukkaa boundaryyn asti
@@ -899,6 +1025,21 @@ public func generateTokenIDs(
                         tokenId: Int32(sampledToken)
                     )
                     continuation.yield(resp)
+                    // If we saw an EOG and armed boundary finishing, emit a visible marker so clients (e.g. Orpheus) can detect it.
+                    if emitEOTMarkerNext {
+                        if let eot = speakEOT {
+                            continuation.yield(StreamResponse(content: "<|eot_id|>", isComplete: false, completionReason: nil, tokenId: eot))
+                        } else {
+                            continuation.yield(StreamResponse(content: "<|eot_id|>", isComplete: false, completionReason: nil, tokenId: nil))
+                        }
+                        emitEOTMarkerNext = false
+                    }
+                    // If this token completed a 7-step boundary while finishing is armed, end the stream now (after yielding the token).
+                    if finishAfterYield {
+                        continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
+                        continuation.finish()
+                        return
+                    }
 
                     // Päivitä akkumulaattori alkuperäisellä piece:llä
                     generatedStringAccumulator += piece
