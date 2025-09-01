@@ -26,6 +26,10 @@ public class LlamaInstance {
     private var interactionFormatter: InteractionFormatting
 
     private var currentContextTokens: [CLlamaToken] = []
+    // Speak-mode cache: concrete token IDs for each SNAC step 0..6
+    private var speakStepIdCache: [[CLlamaToken]] = Array(repeating: [], count: 7)
+    private var speakStepCacheModelId: String? = nil
+    private var lastAudioTokPerStep: [Int32] = Array(repeating: -1, count: 7)
 
     private var interruptFlag: Bool = false
     private var loadingProgressContinuation: AsyncStream<LoadUpdate>.Continuation?
@@ -263,7 +267,27 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
         }
     }
     return (allowed, eotTok)
+
 }
+
+    // Precompute, for each SNAC step (0..6), the concrete token IDs for <custom_token_(base + step*vocab + k)>
+    // Uses tokenization to resolve the IDs reliably even when detokenize() hides specials.
+    private func buildSpeakStepIdCache(model: CLlamaModel, base: Int = 10, vocab: Int = 4096) -> [[CLlamaToken]] {
+        var cache = Array(repeating: [CLlamaToken](), count: 7)
+        for step in 0..<7 {
+            let minBigN = base + step * vocab
+            var arr: [CLlamaToken] = []
+            arr.reserveCapacity(vocab)
+            for k in 0..<vocab {
+                let bigN = minBigN + k
+                if let tok = self.tokenIdForCustomBigN(bigN) {
+                    arr.append(tok)
+                }
+            }
+            cache[step] = arr
+        }
+        return cache
+    }
 
     // Build a *boost* set (no hard mask): audio codes + helpful specials
     private func buildSpeakBoostSet(model: CLlamaModel) -> (boost: Set<Int32>, eot: Int32?) {
@@ -393,88 +417,101 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
         return CLlamaToken(best)
     }
 
-    // Select a *valid* custom token for the current SNAC step (acceptedSoFar % 7),
-    // blocking EOT and any custom token that would NOT map to a legal [0, vocab) id.
+    // Select a *valid* custom token for the current SNAC step using a precomputed allowed-ID list.
+    // If allowEOT == true and eotToken exists, EOT competes (boosted) and also becomes the fallback.
     private func maskedGreedyValidAudioForStep(
         logitsPtr: UnsafePointer<Float>,
         vocabSize: Int,
         acceptedSoFar: Int,
-        whitelist: Set<Int32>,
+        allowedIds: [CLlamaToken],
         eotToken: Int32?,
-        base: Int = 10,
-        vocab: Int = 4096
+        allowEOT: Bool = false,
+        eotBoost: Float = 3.0
     ) -> CLlamaToken {
         var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: vocabSize))
-        let originalLogits = logits
+        let original = logits
         let negInf: Float = -1e30
 
-        // Pre-compute the legal custom-token interval for this step:
-        // bigN in [base + step*vocab, base + step*vocab + vocab - 1]
-        let step = acceptedSoFar % 7
-        let minBigN = base + step * vocab
-        let maxBigN = minBigN + vocab - 1
+        // Hard mask everything
+        for i in 0..<vocabSize { logits[i] = negInf }
 
-        @inline(__always)
-        func customBigN(_ tid: Int32) -> Int? {
-            let s = LlamaKitBridge.detokenize(token: tid, model: self.clModel!)
-            if s.hasPrefix("<custom_token_") && s.hasSuffix(">") {
-                let prefix = "<custom_token_"
-                let start = s.index(s.startIndex, offsetBy: prefix.count)
-                let end = s.index(before: s.endIndex)
-                return Int(s[start...end])
-            }
-            return nil
-        }
-
-        // Mask everything except *valid* custom tokens for this step (EOT is *always* blocked here)
-        for i in 0..<vocabSize {
-            let tid = Int32(i)
-            if let eot = eotToken, tid == eot {
-                logits[i] = negInf
-                continue
-            }
-            if !whitelist.contains(tid) {
-                logits[i] = negInf
-                continue
-            }
-            if let bigN = customBigN(tid) {
-                if bigN < minBigN || bigN > maxBigN {
-                    logits[i] = negInf
+        // Unmask only the allowed custom IDs for this step
+        if !allowedIds.isEmpty {
+            for t in allowedIds {
+                let idx = Int(t)
+                if idx >= 0 && idx < vocabSize {
+                    logits[idx] = original[idx]
                 }
-            } else {
-                logits[i] = negInf
             }
         }
 
-        // Argmax over masked logits
+        // Handle EOT separately
+        if let eot = eotToken {
+            let idx = Int(eot)
+            if idx >= 0 && idx < vocabSize {
+                logits[idx] = allowEOT ? (original[idx] + eotBoost) : negInf
+            }
+        }
+
+        // Anti-loop: rangaise toistamasta samaa tokenia samalla SNAC-stepillä
+        let step = acceptedSoFar % 7
+        if step >= 0 && step < 7 {
+            let lastTok = self.lastAudioTokPerStep[step]
+            if lastTok >= 0 {
+                let i = Int(lastTok)
+                if i >= 0 && i < vocabSize {
+                    logits[i] -= 2.5    // kevyt miinus, katkaisee 7-askeleen kierron
+                }
+            }
+        }
+
+        // Argmax
         var best = -1
         var bestVal = -Float.infinity
         for i in 0..<vocabSize {
             let v = logits[i]
-            if v > bestVal {
-                bestVal = v
-                best = i
-            }
+            if v > bestVal { bestVal = v; best = i }
         }
 
-        // Fallbacks if mask collapsed (avoid returning 0 / '!' when everything was -inf)
+        // Fallbacks
         if best < 0 || !bestVal.isFinite || bestVal <= negInf/2 {
-            if let tok = tokenIdForCustomBigN(minBigN) {
-                print("⚠️ maskedGreedyValidAudioForStep: mask collapsed, forcing <custom_token_\(minBigN)>")
-                return tok
+            if allowEOT, let eot = eotToken {
+                print("⚠️ maskedGreedyValidAudioForStep: mask collapsed, yielding EOT")
+                return CLlamaToken(eot)
             }
-            // Last resort: choose argmax over original (unmasked) logits
-            var b2 = 0
-            var v2 = -Float.infinity
+            if !allowedIds.isEmpty {
+                // choose the highest-logit among allowed IDs from the unmasked distribution
+                var b2 = Int(allowedIds[0])
+                var v2 = original[b2]
+                for t in allowedIds.dropFirst() {
+                    let i = Int(t)
+                    let vv = original[i]
+                    if vv > v2 { v2 = vv; b2 = i }
+                }
+                print("⚠️ maskedGreedyValidAudioForStep: mask collapsed, forcing best-allowed id=\(b2)")
+                if step >= 0 && step < 7 { self.lastAudioTokPerStep[step] = Int32(b2) }
+                return CLlamaToken(b2)
+            }
+            // last resort: global argmax
+            var b3 = 0
+            var v3 = -Float.infinity
             for i in 0..<vocabSize {
-                let vv = originalLogits[i]
-                if vv > v2 { v2 = vv; b2 = i }
+                let vv = original[i]
+                if vv > v3 { v3 = vv; b3 = i }
             }
-            print("⚠️ maskedGreedyValidAudioForStep: hard fallback to unmasked argmax tid=\(b2)")
-            return CLlamaToken(b2)
+            print("⚠️ maskedGreedyValidAudioForStep: hard fallback to global argmax tid=\(b3)")
+            // Jos valittu osuu allowedIds-joukkoon (eli on tämän stepin audio-koodi), päivitä muisti
+            var wasAudio = false
+            for t in allowedIds { if Int(t) == b3 { wasAudio = true; break } }
+            if wasAudio && step >= 0 && step < 7 { self.lastAudioTokPerStep[step] = Int32(b3) }
+            return CLlamaToken(b3)
         }
 
-        return CLlamaToken(best)
+        // Muista valittu audio-token tälle stepille (ei päivitetä jos se oli EOT)
+        var choseAudio = true
+        if let eot = eotToken, best == Int(eot) { choseAudio = false }
+        if choseAudio && step >= 0 && step < 7 { self.lastAudioTokPerStep[step] = Int32(best) }
+        return CLlamaToken(best)    
     }
 
     // Speak-mode sampler with *soft boost* (no hard masking): repetition penalty + temp/top-k/top-p
@@ -701,7 +738,7 @@ public func generateTokenIDs(
             // Chars-based: ~1 window per ~9 chars + margin
             let words = speakText.split { $0.isWhitespace || $0.isNewline }.count
             let chars = speakText.count
-            let byWords = Int(ceil(Double(words) * 1.5)) + 4
+            let byWords = Int(ceil(Double(words) * 2.2)) + 6
             let byChars = Int(ceil(Double(chars) / 9.0)) + 3
             // Use the larger estimate so we don't clip, but clamp to a sane upper bound
             speakBudgetWindows = max(4, min(24, max(byWords, byChars)))
@@ -712,11 +749,12 @@ public func generateTokenIDs(
         var addBOSToken = true
         var addEOSToken = false
         if overrideSystemPrompt == "speak" {
-            effectiveStopSequences = []     // ei antiprompteja
-            addBOSToken = false             // älä lisää BOS
-            addEOSToken = false             // älä pakota EOS:ia
-            // poistetaan myös paikallinen kontekstilista (KV nollataan myöhemmin kun context on käytettävissä)
+            // Match python path: only stop at explicit EOT marker
+            effectiveStopSequences = ["<|eot_id|>"]
+            addBOSToken = false
+            addEOSToken = false
             self.currentContextTokens.removeAll(keepingCapacity: false)
+            self.lastAudioTokPerStep = Array(repeating: -1, count: 7)
         } else {
             // tavallisessa tilassa käytetään normaalit stop-sequt
             effectiveStopSequences = self.eosHandler.getAllEffectiveStopSequences()
@@ -728,43 +766,51 @@ public func generateTokenIDs(
                     continuation.finish(throwing: KuzcoError.engineNotReady)
                     return
                 }
+
+                // Now that we have a valid `model`, compute vocab size and (for speak-mode) the boost helpers.
+                let vocabSize = Int(LlamaKitBridge.getVocabSize(model: model))
+
+                // Speak-mode helpers (soft bias towards audio codes and EOT)
+                var speakBoostSet: Set<Int32> = []
+                var speakEotTok: Int32? = nil
+                if overrideSystemPrompt == "speak" {
+                    let (boostSet, eotTok) = self.buildSpeakBoostSet(model: model)
+                    speakBoostSet = boostSet
+                    speakEotTok = eotTok
+                }
+
+                // Strict whitelist: vain validit <custom_token_*>, plus EOT-aliaset
+                var speakWhitelist: Set<Int32> = []
+                if overrideSystemPrompt == "speak" {
+                    let (allowed, eotCanon) = self.buildCustomWhitelist(model: model)
+                    speakWhitelist = allowed
+                    if speakEotTok == nil { speakEotTok = eotCanon } // suositaan <|eot_id|>
+                }
                 // SPEAK-tilassa varmistetaan puhdas KV-cache
                 if overrideSystemPrompt == "speak" {
                     LlamaKitBridge.clearKeyValueCache(context: context)
                     self.currentContextTokens.removeAll(keepingCapacity: false)
+                    self.lastAudioTokPerStep = Array(repeating: -1, count: 7)
                 }
 
-                // Build a soft *boost* set once for this speak-session (audio codes + specials + EOT aliases)
-                // This mirrors the Python path: we do NOT hard-mask the vocabulary.
-                // We allow the model to pick <|eot_id|> naturally.
-                var speakBoost: Set<Int32> = []
-                var speakEOT: Int32? = nil
-                var speakWhitelist: Set<Int32> = []
+                // Build (or reuse) the concrete ID cache for steps 0..6
                 if overrideSystemPrompt == "speak" {
-                    let b = self.buildSpeakBoostSet(model: model)
-                    speakBoost = b.boost
-                    speakEOT = b.eot
-                    print("🎛️ Speak boost set size = \(speakBoost.count)")
+                    if self.speakStepCacheModelId != self.profile.id || self.speakStepIdCache[0].isEmpty {
+                        self.speakStepIdCache = self.buildSpeakStepIdCache(model: model)
+                        self.speakStepCacheModelId = self.profile.id
+                        let counts = self.speakStepIdCache.map { $0.count }
+                        print("🎛️ Speak step-id cache built: counts per step = \(counts)")
+                    }
                 }
-                // Also build a hard whitelist for early frames (<custom_token_*> + EOT)
-                if overrideSystemPrompt == "speak" {
-                    let w = self.buildCustomWhitelist(model: model)
-                    speakWhitelist = w.allowed
-                    if speakEOT == nil { speakEOT = w.eot }
-                    print("🔒 Speak whitelist size = \(speakWhitelist.count)")
-                }
-                // Capture speak window budget for use inside the loop
+
+                // Capture speak window budget for logging only (do NOT hard stop by it).
                 let speakBudgetWindowsLocal = speakBudgetWindows
-                // Speak-mode local sampling config: greedy, no pruning, no rep-penalty (mirrors Python path)
-                var speakCfg = effectivePredictionConfig
-                // Greedy, no pruning, no rep-penalty → mirrors Python path
-                speakCfg.repetitionPenalty = 1.0
-                speakCfg.temperature = 0.0
-                speakCfg.topProbabilityMass = 1.0
-                speakCfg.topKCandidates = 1
-                // Speak-mode safety rails (soft): count audio tokens, cap total if needed
-                var audioTokensEmitted = 0
-                let maxAudioTokensSpeak = 448 // ~64 multiframe steps (7 tokens each)
+
+                // Safety cap independent of the text-derived estimate to avoid pathological loops.
+                // Generous cap: allow up to ~64 windows worth of audio codes (~64 * 0.085 s ≈ 5.4 s).
+                // We rely on <|eot_id|> to end naturally; this is only an emergency guard.
+                let maxAudioTokensSpeak = 28 * 64
+                let emergencyWindowCap = 64
 
                 let actualMaxContextForThisCall = min(currentCallContextLength, self.settings.contextLength)
 
@@ -833,16 +879,10 @@ public func generateTokenIDs(
                     let maxTokensForThisGeneration = effectivePredictionConfig.maxOutputTokens_effective(actualMaxContextForThisCall - UInt32(kvCachePosition))
 
                     var dbgCount = 0
-                    var recentAudioTokens: [CLlamaToken] = []
                     // Counters for speak-mode gating
                     var audioCustomSeen = 0            // count of <custom_token_*> seen (for safety cap)
                     var validAudioAccepted = 0         // count of valid mapped SNAC ids (Python-style)
-                    // Boundary-finishing control
-                    var pendingFinishAtBoundary = false
-                    var forceTailFillToBoundary = false
-                    // Emit a synthetic <|eot_id|> marker to the client, and/or finish after we've yielded the boundary token
-                    var emitEOTMarkerNext = false
-                    var finishAfterYield = false
+                    var unlocked = false               // becomes true right after first 28 valid codes
 
                     while tokensGeneratedThisTurn < maxTokensForThisGeneration {
                         var sampledToken: CLlamaToken = CLlamaToken(0)
@@ -857,50 +897,42 @@ public func generateTokenIDs(
                         }
 
                         if overrideSystemPrompt == "speak" {
-                            let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
+                            // How many 7-id windows have we emitted *after* unlock?
+                            let windowsSoFar = unlocked ? (1 + ((validAudioAccepted - 28) / 7)) : 0
 
-                            var proposed: CLlamaToken
+                            // At a 7-token boundary?
+                            let atBoundary =
+                                unlocked &&
+                                ((validAudioAccepted - 28) >= 0) &&
+                                ((validAudioAccepted - 28) % 7) == 6
 
-                            if forceTailFillToBoundary {
-                                // Fill strictly with valid custom codes up to the next 7-boundary (EOT blocked)
-                                proposed = self.maskedGreedyValidAudioForStep(
-                                    logitsPtr: logits,
-                                    vocabSize: nVocab,
-                                    acceptedSoFar: validAudioAccepted,
-                                    whitelist: speakWhitelist,
-                                    eotToken: speakEOT
-                                )
-                            } else {
-                                // Deterministic base sampler (no boost)
-                                var speakCfg = effectivePredictionConfig
-                                speakCfg.repetitionPenalty = 1.0
-                                speakCfg.temperature = 0.0
-                                speakCfg.topProbabilityMass = 1.0
-                                speakCfg.topKCandidates = 1
+                            // Soft-stop policy:
+                            //  • Start allowing EOT a little *before* the heuristic budget (soft start).
+                            //  • Only *force* stop after a small grace beyond the budget.
+                            let graceWindows = 8               // extra windows beyond heuristic budget
+                            let eotSoftStartOffset = 3         // start allowing EOT 1 window before budget
 
-                                proposed = self.boostedSampleForSpeak(
-                                    logitsPtr: logits,
-                                    vocabSize: nVocab,
-                                    cfg: speakCfg,
-                                    recentTokens: recentAudioTokens,
-                                    boostSet: speakBoost,
-                                    boostAmount: 0.0,
-                                    repeatWindow: 128
-                                )
+                            let allowEOTNow = atBoundary && (windowsSoFar >= max(1, speakBudgetWindowsLocal - eotSoftStartOffset))
+                            let forceStopNow = atBoundary && (windowsSoFar >= speakBudgetWindowsLocal + graceWindows)
 
-                                // Before unlock, force a *valid* custom token for the current SNAC step.
-                                if validAudioAccepted < 28 {
-                                    proposed = self.maskedGreedyValidAudioForStep(
-                                        logitsPtr: logits,
-                                        vocabSize: nVocab,
-                                        acceptedSoFar: validAudioAccepted,
-                                        whitelist: speakWhitelist,
-                                        eotToken: speakEOT
-                                    )
-                                }
+                            if forceStopNow {
+                                print("🛑 Speak: soft budget reached (\(windowsSoFar)/\(speakBudgetWindowsLocal)+\(graceWindows)) — stopping at boundary.")
+                                continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
+                                continuation.finish()
+                                return
                             }
 
-                            sampledToken = proposed
+                            let step = validAudioAccepted % 7
+                            let allowedNow = (step >= 0 && step < 7) ? self.speakStepIdCache[step] : []
+                            sampledToken = self.maskedGreedyValidAudioForStep(
+                                logitsPtr: logits,
+                                vocabSize: vocabSize,
+                                acceptedSoFar: validAudioAccepted,
+                                allowedIds: allowedNow,
+                                eotToken: speakEotTok,
+                                allowEOT: allowEOTNow,
+                                eotBoost: allowEOTNow ? 12.0 : 3.0
+                            )
                         } else {
                             sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
                         }
@@ -913,73 +945,47 @@ public func generateTokenIDs(
                         let isCustom = piece.hasPrefix("<custom_token_")
                         if isCustom {
                             audioCustomSeen += 1
-                            // Count only **valid** mapped codes (Python-style)
                             if let mapped = self.snacId(fromCustomPiece: piece, acceptedSoFar: validAudioAccepted) {
                                 validAudioAccepted += 1
-                                if pendingFinishAtBoundary && validAudioAccepted >= 28 && (validAudioAccepted % 7 == 0) {
-                                    // Defer finishing until after we have yielded the token that completed the boundary.
-                                    finishAfterYield = true
-                                }
                                 if validAudioAccepted <= 35 {
                                     print("🔎 SNAC ok[\(validAudioAccepted-1)] = \(mapped)")
                                 }
-                                if validAudioAccepted == 28 {
+                                if !unlocked, validAudioAccepted == 28 {
+                                    unlocked = true
                                     print("🔓 Speak: unlocked after first 28 valid SNAC codes (custom seen=\(audioCustomSeen))")
                                 }
-                            }
-                            else {
-                                if piece.hasPrefix("<custom_token_") {
-                                    print("⚠️ snacId parse failed for piece '\(piece)' at accepted=\(validAudioAccepted)")
+                                // Soft-stop policy:
+                                //  - Encourage EOT near the heuristic budget (allowEOTNow with stronger eotBoost).
+                                //  - Force-stop only after a small grace beyond the budget (see forceStopNow).
+                                //  - Emergency caps remain as a last-resort guard.
+                                if unlocked {
+                                    let windowsSoFar = 1 + ((validAudioAccepted - 28) / 7)
+                                    if windowsSoFar >= emergencyWindowCap { // ~64 * 0.085 s ≈ 5.4 s
+                                        print("🛑 Speak: emergency cap reached (\(windowsSoFar) windows) — stopping.")
+                                        continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .maxTokensReached))
+                                        continuation.finish()
+                                        return
+                                    }
                                 }
+                            } else {
+                                // Invalid custom piece for this step (e.g., small control code 1/2/3/4/5/6)
+                                print("⚠️ snacId parse failed for piece '\(piece)' at accepted=\(validAudioAccepted)")
                             }
-                            // Track for (soft) repetition penalty window
-                            recentAudioTokens.append(sampledToken)
-                            if recentAudioTokens.count > 512 {
-                                recentAudioTokens.removeFirst(recentAudioTokens.count - 512)
+
+                            // Safety cap to avoid pathological loops even if valid codes don't accumulate
+                            if audioCustomSeen >= maxAudioTokensSpeak {
+                                print("🛑 Speak: audio token hard cap hit (\(audioCustomSeen) ≥ \(maxAudioTokensSpeak)) — stopping.")
+                                continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .maxTokensReached))
+                                continuation.finish()
+                                return
                             }
-                        }
-                        // 🚦 Stop conditions to avoid repeats once we have enough audio
-                        // 1) If we have unlocked and now see a non-custom token, finish naturally (audio segment ended)
-                        if validAudioAccepted >= 28 {
-                            if !isCustom && !pendingFinishAtBoundary {
-                                pendingFinishAtBoundary = true
-                                forceTailFillToBoundary = true
-                                emitEOTMarkerNext = true     // ⬅️ make the stop visible to Orpheus
-                                print("✅ Speak: non-audio after unlock → finishing at next boundary")
-                            }
-                            let acceptedWindows = validAudioAccepted / 28
-                            if acceptedWindows >= speakBudgetWindowsLocal && !pendingFinishAtBoundary {
-                                pendingFinishAtBoundary = true
-                                forceTailFillToBoundary = true
-                                emitEOTMarkerNext = true     // ⬅️ also announce stop when we hit window budget
-                                print("⏱️ Speak: window budget reached (\(acceptedWindows)/\(speakBudgetWindowsLocal)) → finishing at next boundary")
-                            }
-                        }
-                        // Safety cap to avoid pathological loops even if valid codes don't accumulate
-                        if audioCustomSeen >= maxAudioTokensSpeak {
-                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .maxTokensReached))
-                            continuation.finish()
-                            return
                         }
                     }
 
-                    if LlamaKitBridge.isEndOfGenerationToken(model: model, token: sampledToken) {
-                        if overrideSystemPrompt == "speak" {
-                            if validAudioAccepted < 28 {
-                                // Priming-vaiheessa ohitetaan EOG kokonaan
-                            } else if !pendingFinishAtBoundary {
-                                // EOG after unlock → fill to next 7-boundary then finish; also emit a synthetic EOT marker for clients.
-                                pendingFinishAtBoundary = true
-                                forceTailFillToBoundary = true
-                                emitEOTMarkerNext = true
-                                print("✅ Speak: EOG after unlock → finishing at next boundary")
-                            }
-                            // Älä lopeta tässä, jatka silmukkaa boundaryyn asti
-                        } else {
-                            continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
-                            continuation.finish()
-                            return
-                        }
+                    if overrideSystemPrompt != "speak", LlamaKitBridge.isEndOfGenerationToken(model: model, token: sampledToken) {
+                        continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
+                        continuation.finish()
+                        return
                     }
 
 //                    let piece = LlamaKitBridge.detokenize(token: sampledToken, model: model)
@@ -990,6 +996,18 @@ public func generateTokenIDs(
                         let isCustom = piece.hasPrefix("<custom_token_")
                         print("🎯 tokenId=\(sampledToken) piece='\(piece)' custom=\(isCustom)")
                         dbgCount += 1
+                    }
+
+                    // Soft nudge: if we're one token *before* a window boundary after unlock,
+                    // bias toward emitting EOT by contributing the literal stop sequence via content check
+                    if overrideSystemPrompt == "speak",
+                       unlocked,
+                       ((validAudioAccepted - 28) >= 0),
+                       ((validAudioAccepted - 28) % 7) == 6,
+                       let eot = speakEotTok {
+                        // Slightly bias textual stop by appending nothing (sampling already has EOT boosted via speakBoostSet).
+                        // No logits surgery here; the boosted sampler already prefers EOT as one of boosted tokens.
+                        _ = eot // placeholder to silence 'unused' in case of different build flags
                     }
 
                     if !allStopSequences.isEmpty {
@@ -1025,21 +1043,6 @@ public func generateTokenIDs(
                         tokenId: Int32(sampledToken)
                     )
                     continuation.yield(resp)
-                    // If we saw an EOG and armed boundary finishing, emit a visible marker so clients (e.g. Orpheus) can detect it.
-                    if emitEOTMarkerNext {
-                        if let eot = speakEOT {
-                            continuation.yield(StreamResponse(content: "<|eot_id|>", isComplete: false, completionReason: nil, tokenId: eot))
-                        } else {
-                            continuation.yield(StreamResponse(content: "<|eot_id|>", isComplete: false, completionReason: nil, tokenId: nil))
-                        }
-                        emitEOTMarkerNext = false
-                    }
-                    // If this token completed a 7-step boundary while finishing is armed, end the stream now (after yielding the token).
-                    if finishAfterYield {
-                        continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
-                        continuation.finish()
-                        return
-                    }
 
                     // Päivitä akkumulaattori alkuperäisellä piece:llä
                     generatedStringAccumulator += piece
