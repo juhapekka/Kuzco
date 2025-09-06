@@ -237,6 +237,54 @@ public class LlamaInstance {
 
     }
 
+    // Lisää LlamaInstanceen (esim. prewarmEngine() jälkeen)
+private func sanitizeSpeakText(_ s: String) -> String {
+    var out = s.precomposedStringWithCanonicalMapping
+    // Suojaa tagit, ettei niitä muokata
+    let tags = ["<laugh>","<sigh>","<groan>","<chuckle>","<yawn>","<gasp>","<cough>","<sniffle>"]
+    var hold: [String:String] = [:]
+    for (i, t) in tags.enumerated() {
+        // käytä pienikirjaimista placeholderia, jotta lowercased()-vaihe ei riko palautusta
+        let phUpper = "§§TAG\(i)§§"
+        let ph = phUpper.lowercased()
+        hold[ph] = t
+        out = out.replacingOccurrences(of: t, with: ph)
+    }
+    // “fiksut” lainausmerkit & viivat -> ASCII
+    let repl: [String:String] = [
+        "’":"'", "‘":"'", "‚":"'", "ʼ":"'",
+        "“":"\"", "”":"\"", "„":"\"",
+        "—":"-", "–":"-", "−":"-",
+        "\u{00A0}":" ", "\u{2009}":" ", "\u{200A}":" ", "\u{200B}":""
+    ]
+    for (k, v) in repl { out = out.replacingOccurrences(of: k, with: v) }
+    while out.contains("  ") { out = out.replacingOccurrences(of: "  ", with: " ") }
+    out = out.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    // Tuo isot kirjaimet alas (vain ei‑tagitekstiin, placeholderit ovat jo pienellä)
+    out = out.lowercased()
+
+    // Salli vain perus-ASCII (32..126). Muut korvataan välilyönnillä.
+    var ascii = ""
+    ascii.reserveCapacity(out.count)
+    for u in out.unicodeScalars {
+        if u.value >= 32 && u.value <= 126 {
+            ascii.unicodeScalars.append(u)
+        } else {
+            ascii.append(" ")
+        }
+    }
+    out = ascii
+
+    // Palauta tagit
+    for (ph, t) in hold {
+        out = out.replacingOccurrences(of: ph, with: t)
+    }
+    // Siivoa mahdolliset tupla-välit vielä kerran
+    while out.contains("  ") { out = out.replacingOccurrences(of: "  ", with: " ") }
+    return out
+}
+
 // Build whitelist for speak-mode: allow only <custom_token_N> and end aliases.
 // Prefer <|eot_id|> if present; otherwise take the first alias we find.
 private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, eot: Int32?) {
@@ -320,6 +368,55 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
             }
         }
         return (boost, eotTok)
+    }
+
+    // IDs for expressive tag tokens like <laugh>, <sigh>, ...
+    private func buildExpressiveTagIds(model: CLlamaModel) -> Set<Int32> {
+        let expressive: Set<String> = ["<laugh>", "<sigh>", "<groan>", "<chuckle>", "<yawn>", "<gasp>", "<cough>", "<sniffle>"]
+        var ids = Set<Int32>(); ids.reserveCapacity(expressive.count + 4)
+        let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
+        for tid in 0..<nVocab {
+            let s = LlamaKitBridge.detokenize(token: Int32(tid), model: model)
+            if expressive.contains(s) { ids.insert(Int32(tid)) }
+        }
+        return ids
+    }
+
+    // IDs for other bracketed tags like <|audio|>, <|speaker:...|>, etc. (exclude custom audio/EOT)
+    private func buildOtherBracketTagIds(model: CLlamaModel) -> Set<Int32> {
+        let endAliases: Set<String> = ["<|eot_id|>", "<|eos|>", "<|endoftext|>", "<|im_end|>"]
+        var ids = Set<Int32>(); ids.reserveCapacity(128)
+        let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
+        for tid in 0..<nVocab {
+            let s = LlamaKitBridge.detokenize(token: Int32(tid), model: model)
+            if s.hasPrefix("<") && s.hasSuffix(">") {
+                if s.hasPrefix("<custom_token_") { continue }
+                if endAliases.contains(s) { continue }
+                ids.insert(Int32(tid))
+            }
+        }
+        return ids
+    }
+
+    // IDs for small control custom tokens <custom_token_1>..<custom_token_9>
+    // These appear before/around casing, apostrophes, etc., and must be allowed
+    // without contributing to the 7-step SNAC counter.
+    private func buildControlCustomSmallSet(model: CLlamaModel, base: Int = 10) -> Set<Int32> {
+        var ids = Set<Int32>(); ids.reserveCapacity(16)
+        let nVocab = Int(LlamaKitBridge.getVocabSize(model: model))
+        for tid in 0..<nVocab {
+            let s = LlamaKitBridge.detokenize(token: Int32(tid), model: model)
+            if s.hasPrefix("<custom_token_") && s.hasSuffix(">") {
+                let inner = s.dropFirst("<custom_token_".count).dropLast()
+                if let n = Int(inner), n > 0, n < base { ids.insert(Int32(tid)) }
+            }
+        }
+        return ids
+    }
+
+    // Quick string check for expressive tags
+    private func isExpressiveTagString(_ s: String) -> Bool {
+        return s == "<laugh>" || s == "<sigh>" || s == "<groan>" || s == "<chuckle>" || s == "<yawn>" || s == "<gasp>" || s == "<cough>" || s == "<sniffle>"
     }
 
     // Map `<custom_token_N>` piece to SNAC id given how many valid codes have been accepted so far.
@@ -426,7 +523,11 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
         allowedIds: [CLlamaToken],
         eotToken: Int32?,
         allowEOT: Bool = false,
-        eotBoost: Float = 3.0
+        eotBoost: Float = 3.0,
+        // NEW: allow small control codes and expressive tags to pass through
+        extraAllowed: Set<Int32> = [],
+        expressiveAllowed: Set<Int32> = [],
+        extraBoost: Float = 0.2
     ) -> CLlamaToken {
         var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: vocabSize))
         let original = logits
@@ -453,6 +554,25 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
             }
         }
 
+        // Also allow small control custom tokens and expressive tags (do not compete strongly)
+        if !extraAllowed.isEmpty {
+            for tid in extraAllowed {
+                let i = Int(tid)
+                if i >= 0 && i < vocabSize {
+                    // keep their native score with a small nudge so they can surface when needed
+                    logits[i] = max(logits[i], original[i] + extraBoost)
+                }
+            }
+        }
+        if !expressiveAllowed.isEmpty {
+            for tid in expressiveAllowed {
+                let i = Int(tid)
+                if i >= 0 && i < vocabSize {
+                    logits[i] = max(logits[i], original[i] + extraBoost)
+                }
+            }
+        }
+
         // Anti-loop: rangaise toistamasta samaa tokenia samalla SNAC-stepillä
         let step = acceptedSoFar % 7
         if step >= 0 && step < 7 {
@@ -460,7 +580,7 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
             if lastTok >= 0 {
                 let i = Int(lastTok)
                 if i >= 0 && i < vocabSize {
-                    logits[i] -= 2.5    // kevyt miinus, katkaisee 7-askeleen kierron
+                    logits[i] -= 3.5    // kevyt miinus, katkaisee 7-askeleen kierron
                 }
             }
         }
@@ -511,7 +631,7 @@ private func buildCustomWhitelist(model: CLlamaModel) -> (allowed: Set<Int32>, e
         var choseAudio = true
         if let eot = eotToken, best == Int(eot) { choseAudio = false }
         if choseAudio && step >= 0 && step < 7 { self.lastAudioTokPerStep[step] = Int32(best) }
-        return CLlamaToken(best)    
+        return CLlamaToken(best)
     }
 
     // Speak-mode sampler with *soft boost* (no hard masking): repetition penalty + temp/top-k/top-p
@@ -718,9 +838,10 @@ public func generateTokenIDs(
 
         let promptString: String
         if (overrideSystemPrompt == "speak"),
-        let last = dialogue.last, last.role == .user {
+           let last = dialogue.last, last.role == .user {
             let voice = "tara"
-            promptString = "<|audio|>\(voice): \(last.text)<|eot_id|>"
+            let clean = sanitizeSpeakText(last.text)
+            promptString = "<|audio|>\(voice): \(clean)<|eot_id|>"
         } else {
             promptString = interactionFormatter.constructPrompt(
                 for: dialogue,
@@ -732,7 +853,7 @@ public func generateTokenIDs(
         var speakText: String = ""
         var speakBudgetWindows: Int = Int.max
         if overrideSystemPrompt == "speak", let last = dialogue.last, last.role == .user {
-            speakText = last.text
+            speakText = sanitizeSpeakText(last.text)
             // Heuristic tuned for SNAC @24kHz: ~0.085 s per window (28 ids)
             // Words-based: ~1.5 windows per word + small lead-in/out margin
             // Chars-based: ~1 window per ~9 chars + margin
@@ -751,7 +872,7 @@ public func generateTokenIDs(
         if overrideSystemPrompt == "speak" {
             // Match python path: only stop at explicit EOT marker
             effectiveStopSequences = ["<|eot_id|>"]
-            addBOSToken = false
+            addBOSToken = true
             addEOSToken = false
             self.currentContextTokens.removeAll(keepingCapacity: false)
             self.lastAudioTokPerStep = Array(repeating: -1, count: 7)
@@ -777,6 +898,18 @@ public func generateTokenIDs(
                     let (boostSet, eotTok) = self.buildSpeakBoostSet(model: model)
                     speakBoostSet = boostSet
                     speakEotTok = eotTok
+                }
+
+                // Allow small control codes and expressive tags to pass through the mask
+                var speakControlSmallSet: Set<Int32> = []
+                var speakExpressiveIds: Set<Int32> = []
+                var speakOtherTagIds: Set<Int32> = []
+                if overrideSystemPrompt == "speak" {
+                    speakControlSmallSet = self.buildControlCustomSmallSet(model: model)
+                    speakExpressiveIds = self.buildExpressiveTagIds(model: model)
+                }
+                if overrideSystemPrompt == "speak" {
+                    speakOtherTagIds = self.buildOtherBracketTagIds(model: model)
                 }
 
                 // Strict whitelist: vain validit <custom_token_*>, plus EOT-aliaset
@@ -917,6 +1050,16 @@ public func generateTokenIDs(
 
                             if forceStopNow {
                                 print("🛑 Speak: soft budget reached (\(windowsSoFar)/\(speakBudgetWindowsLocal)+\(graceWindows)) — stopping at boundary.")
+                                // Emit an explicit EOT token so downstream audio decoders can flush properly.
+                                if let eot = speakEotTok {
+                                    let eotPiece = LlamaKitBridge.detokenize(token: Int32(eot), model: model)
+                                    continuation.yield(StreamResponse(
+                                        content: eotPiece,
+                                        isComplete: false,
+                                        completionReason: nil,
+                                        tokenId: Int32(eot)
+                                    ))
+                                }
                                 continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .natural))
                                 continuation.finish()
                                 return
@@ -924,6 +1067,8 @@ public func generateTokenIDs(
 
                             let step = validAudioAccepted % 7
                             let allowedNow = (step >= 0 && step < 7) ? self.speakStepIdCache[step] : []
+                            // Stronger allowance for control/bracket tags before full unlock, to avoid starving the model's prosody setup.
+                            let early = validAudioAccepted < 28
                             sampledToken = self.maskedGreedyValidAudioForStep(
                                 logitsPtr: logits,
                                 vocabSize: vocabSize,
@@ -931,7 +1076,10 @@ public func generateTokenIDs(
                                 allowedIds: allowedNow,
                                 eotToken: speakEotTok,
                                 allowEOT: allowEOTNow,
-                                eotBoost: allowEOTNow ? 12.0 : 3.0
+                                eotBoost: allowEOTNow ? 16.0 : 3.0,
+                                extraAllowed: speakControlSmallSet.union(speakOtherTagIds),
+                                expressiveAllowed: speakExpressiveIds,
+                                extraBoost: early ? 2.2 : 0.6
                             )
                         } else {
                             sampledToken = LlamaKitBridge.sampleTokenGreedy(model: model, context: context, logits: logits)
@@ -944,8 +1092,9 @@ public func generateTokenIDs(
                     if overrideSystemPrompt == "speak" {
                         let isCustom = piece.hasPrefix("<custom_token_")
                         if isCustom {
-                            audioCustomSeen += 1
+                            // classify custom into "valid SNAC for this step" or "small control"
                             if let mapped = self.snacId(fromCustomPiece: piece, acceptedSoFar: validAudioAccepted) {
+                                audioCustomSeen += 1
                                 validAudioAccepted += 1
                                 if validAudioAccepted <= 35 {
                                     print("🔎 SNAC ok[\(validAudioAccepted-1)] = \(mapped)")
@@ -954,13 +1103,10 @@ public func generateTokenIDs(
                                     unlocked = true
                                     print("🔓 Speak: unlocked after first 28 valid SNAC codes (custom seen=\(audioCustomSeen))")
                                 }
-                                // Soft-stop policy:
-                                //  - Encourage EOT near the heuristic budget (allowEOTNow with stronger eotBoost).
-                                //  - Force-stop only after a small grace beyond the budget (see forceStopNow).
-                                //  - Emergency caps remain as a last-resort guard.
+                                // Emergency guard after unlock
                                 if unlocked {
                                     let windowsSoFar = 1 + ((validAudioAccepted - 28) / 7)
-                                    if windowsSoFar >= emergencyWindowCap { // ~64 * 0.085 s ≈ 5.4 s
+                                    if windowsSoFar >= emergencyWindowCap {
                                         print("🛑 Speak: emergency cap reached (\(windowsSoFar) windows) — stopping.")
                                         continuation.yield(StreamResponse(content: "", isComplete: true, completionReason: .maxTokensReached))
                                         continuation.finish()
@@ -968,8 +1114,10 @@ public func generateTokenIDs(
                                     }
                                 }
                             } else {
-                                // Invalid custom piece for this step (e.g., small control code 1/2/3/4/5/6)
-                                print("⚠️ snacId parse failed for piece '\(piece)' at accepted=\(validAudioAccepted)")
+                                // Small control custom codes (e.g., <custom_token_1>..<custom_token_9>) — allowed but
+                                // do NOT increment validAudioAccepted. Still count towards a broad safety cap.
+                                audioCustomSeen += 1
+                                print("ℹ️ control custom kept: '\(piece)' (accepted=\(validAudioAccepted))")
                             }
 
                             // Safety cap to avoid pathological loops even if valid codes don't accumulate
@@ -979,6 +1127,9 @@ public func generateTokenIDs(
                                 continuation.finish()
                                 return
                             }
+                        } else if self.isExpressiveTagString(piece) {
+                            // Expressive tags are allowed to pass through but do not affect counters
+                            print("🎭 expressive tag: \(piece)")
                         }
                     }
 
@@ -1031,6 +1182,18 @@ public func generateTokenIDs(
                                 print("🦙 Kuzco - Stopped by antiprompt '\(stopSeq)' (piece: \"\(piece)\", yielded: \"\(pieceToYield)\") 🦙")
                                 break
                             }
+                        }
+                    }
+
+                    // In speak-mode suppress textual content *except* custom audio tokens and recognized tags,
+                    // so Orpheus can still parse <custom_token_N> and <|eot_id|>/<laugh>...
+                    if overrideSystemPrompt == "speak" {
+                        if piece.hasPrefix("<custom_token_")
+                            || self.isExpressiveTagString(piece)
+                            || piece == "<|eot_id|>" {
+                            pieceToYield = piece            // ⟵ anna Orpheuksen nähdä nämä
+                        } else {
+                            pieceToYield = ""               // ⟵ kaikki muu tyhjäksi
                         }
                     }
 
